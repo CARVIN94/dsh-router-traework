@@ -4,15 +4,26 @@ DSH 插件：为 [dsh-router](https://github.com/CARVIN94/dsh-router) 提供 `tr
 
 本项目是 [traework2api](https://github.com/Sliverkiss/traework2api) 的 DSH 插件版，上游参考 [dsh-router](https://github.com/CARVIN94/dsh-router)。
 
-## 安装
+## 安装(DSH)
+
+先装核心 [dsh-router-core](https://github.com/CARVIN94/dsh-router)(dsh-router 仓库,提供面板 + 内置供应商),再装本插件:
 
 ```bash
-npm install dsh-router-traework
-# 或
+cd ~/.dsh/profiles/web
+pnpm add dsh-router-core
 pnpm add dsh-router-traework
 ```
 
-确保 [dsh-router](https://github.com/CARVIN94/dsh-router) 已安装。本插件通过 `cordis.patch.yml` 自动挂载到 DSH bundle stack，并以 cordis service `router.suppliers` 向 dsh-router 注册 `traework` 供应商工厂。
+装完确认 `~/.dsh/profiles/web/package.json`:
+- `dependencies` 含 `dsh-router-core` 和 `dsh-router-traework`(npm 版本号);
+- `dsh.profile.bundles` 含 `dsh-router` 和 `dsh-router-traework`——
+  插件的 `cordis.patch.yml` 会自动插入 bundle,一般无需手改。
+
+然后**重启 `dsh web`**。本插件以 cordis service `router.suppliers` 向 dsh-router
+注册 `traework` 供应商,面板「供应商」出现 traework 卡片,加账号即用。
+
+> 本地开发版:不用 npm,直接 `dependencies` 加
+> `"dsh-router-traework": "link:/path/to/dsh-router-traework"` 指向本地仓库。
 
 ## 目录
 
