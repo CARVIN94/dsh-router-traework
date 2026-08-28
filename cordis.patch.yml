@@ -1,0 +1,9 @@
+# dsh-router-traework bundle patch
+#
+# Mounts dsh-router-traework into the DSH cordis bundle stack. This plugin
+# provides the `router.suppliers` cordis service (host half) so dsh-router can
+# load the traework supplier. Install BEFORE dsh-router (or any order —
+# dsh-router defers via ctx.inject until the service is available).
+- insert:
+    - id: dsh-router-traework
+      name: 'dsh-router-traework'
