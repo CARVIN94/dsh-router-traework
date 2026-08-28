@@ -37,7 +37,7 @@ export interface CredentialStoreLike {
 
 /** 供应商配置：dsh-router 核心注入的运行时环境。 */
 export interface SupplierEnv {
-  /** 数据目录（state.json / models.json / keys.json 所在目录）。 */
+  /** 数据目录（state.json / keys.json 所在目录）。 */
   dataDir: string
   /** 日志。 */
   log: (msg: string) => void

@@ -70,7 +70,7 @@ export class TraeworkSupplier implements Supplier {
   readonly name = 'traework'
   readonly priority = 0 // 免费通道，最优先
 
-  /** keys.json / models.json 所在目录由 stateFile 推导。 */
+  /** 数据目录由 stateFile 推导。 */
   get stateFile(): string {
     return this.cfg.stateFile
   }
