@@ -39,7 +39,7 @@ export default function factory(env: SupplierEnv): SupplierModule & { removeLink
     status: (): SupplierStatus => instance!.status(),
     listModels: (force?: boolean): ModelInfo[] | Promise<ModelInfo[]> => instance!.listModels(force),
     getAlias: (): string => instance!.getAlias(),
-    testModel: (mid: string): Promise<{ ok: boolean; error?: string }> => instance!.testModel(mid),
+    lastError: (): string | undefined => instance!.lastError(),
     chatCompletions: (req: ChatRequest, res: ServerResponse): Promise<boolean> => instance!.chatCompletions(req, res),
     dispose: (): void => instance!.dispose(),
     generateLoginUrl: (): string => instance!.generateLoginUrl(),

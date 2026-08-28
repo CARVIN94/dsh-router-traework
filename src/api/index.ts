@@ -83,6 +83,8 @@ export class TraeworkSupplier implements Supplier {
   private credentials: CredentialStoreLike
   private log: (msg: string) => void
   private modelsCache: ModelInfo[] | undefined
+  /** 上次 chatCompletions 失败原因（供核心测试模型汇总诊断）。 */
+  private lastErrText: string | undefined
   private pendingLogin: { machineId: string; deviceId: string } | undefined
 
   constructor(cfg: Partial<TraewConfig>, store: SupplierConfigStoreLike, credentials: CredentialStoreLike, log?: (msg: string) => void) {
@@ -302,71 +304,10 @@ export class TraeworkSupplier implements Supplier {
     this.store.setAllModelsEnabled(this.id, enabled, this.allModels().map((m) => m.id))
   }
 
-  /** 测试模型：用最小请求走真实通道，返回 ok/error。 */
-  async testModel(id: string): Promise<{ ok: boolean; error?: string }> {
-    const configName = mapModel(id, this.allKnownIds(), this.cfg.defaultModel)
-    if (configName === undefined) return { ok: false, error: `unknown model ${JSON.stringify(id)}` }
-    const body = JSON.stringify({
-      model: configName,
-      messages: [{ role: 'user', content: 'ping' }],
-      stream: false,
-      max_tokens: 8,
-    })
-    const tried = new Set<string>()
-    let lastErr: string | undefined
-    for (let i = 0; i < 3; i++) {
-      const acct = this.pool.pickExcluding(tried)
-      if (!acct) break
-      tried.add(acct.uid)
-
-      try {
-        const refreshed = await this.client.refreshTokenIfNeeded(acct, this.cfg.refreshSkewMs)
-        if (refreshed) this.saveAuth(acct)
-      } catch (err) {
-        const ue = err as { kind?: string }
-        if (ue.kind === 'session_dead') this.pool.disable(acct.uid, 'refresh session dead')
-        else this.pool.cooldown(acct.uid, 'error_threshold', this.cfg.errCooldownMs, `refresh: ${(err as Error).message}`)
-        lastErr = `refresh: ${(err as Error).message}`
-        continue
-      }
-
-      let streamRes: { body: ReadableStream<Uint8Array> | null; status: number; respBody: string }
-      try {
-        streamRes = await this.client.chatStream(acct, body)
-      } catch (err) {
-        this.pool.noteError(acct.uid, this.cfg.errThreshold, this.cfg.errCooldownMs)
-        lastErr = (err as Error).message
-        continue
-      }
-      if (streamRes.status >= 400) {
-        const kind = classify(streamRes.status, streamRes.respBody)
-        switch (kind) {
-          case 'plan_limit':
-            this.pool.cooldown(acct.uid, 'plan_limit', this.cfg.planCooldownMs, 'plan 权益不足')
-            break
-          case 'soft_rate':
-            this.pool.cooldown(acct.uid, 'soft_rate', this.cfg.softCooldownMs, '429 rate limit')
-            break
-          case 'session_dead':
-            this.pool.disable(acct.uid, 'session dead')
-            break
-          default:
-            this.pool.noteError(acct.uid, this.cfg.errThreshold, this.cfg.errCooldownMs)
-        }
-        lastErr = `upstream ${streamRes.status}: ${streamRes.respBody.slice(0, 120)}`
-        continue
-      }
-
-      const { error } = await aggregate(linesFromStream(streamRes.body!))
-      if (error) {
-        this.pool.noteError(acct.uid, this.cfg.errThreshold, this.cfg.errCooldownMs)
-        lastErr = error.message
-        continue
-      }
-      this.pool.noteSuccess(acct.uid)
-      return { ok: true }
-    }
-    return { ok: false, error: lastErr ?? '没有健康账号可测试' }
+  /** 上次 chatCompletions 失败原因（诊断用）。测试模型由 dsh-router 核心统一走
+   *  chatCompletions 路径（账号池回退/冷却自动生效），插件只需暴露失败原因。 */
+  lastError(): string | undefined {
+    return this.lastErrText
   }
 
   // -------------------------------------------------------------------------
@@ -439,6 +380,7 @@ export class TraeworkSupplier implements Supplier {
     const configName = mapModel(req.model, this.allKnownIds(), this.cfg.defaultModel)
     if (configName === undefined) {
       // 不是本供应商的模型：返回 false 让路由器尝试下一个供应商（不霸占响应）
+      this.lastErrText = `unknown model ${JSON.stringify(req.model)}`
       return false
     }
     if (this.store.get(this.id).disabled.includes(configName)) {
@@ -532,7 +474,10 @@ export class TraeworkSupplier implements Supplier {
     }
 
     // 所有账号尝试失败：不写响应，返回 false 让路由器继续 fallback（组合回退到下一个模型/供应商）
-    if (lastErr) this.log(`traework chat failed: ${lastErr.message}`)
+    if (lastErr) {
+      this.lastErrText = lastErr.message
+      this.log(`traework chat failed: ${lastErr.message}`)
+    }
     return false
   }
 

@@ -60,10 +60,13 @@ export interface SupplierModule {
   listModels(force?: boolean): Promise<ModelInfo[]> | ModelInfo[]
   getAlias(): string
   chatCompletions(req: ChatRequest, res: ServerResponse): Promise<boolean>
-  testModel(id: string): Promise<{ ok: boolean; error?: string }>
   dispose(): void
 
   // ---- 差异化能力（可选） ----
+
+  /** 上次 chatCompletions 失败原因（诊断用）。测试模型由 dsh-router 核心统一走
+   *  chatCompletions 路径（账号池回退/冷却自动生效），插件只需暴露失败原因。 */
+  lastError?(): string | undefined
   generateLoginUrl?(): string | { ok: boolean; error?: string; loginUrl?: string }
   completeLogin?(callbackUrl: string): Promise<{ uid: string; nickname: string }>
   checkinNow?(): Promise<{ ok: boolean; total: number; succeeded: number; already?: number; error?: string; results?: Array<{ uid: string; ok: boolean; status?: string; message?: string }> }>

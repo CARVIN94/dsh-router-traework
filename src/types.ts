@@ -58,7 +58,6 @@ export interface Supplier {
   getAlias(): string
   customModelIds?(): string[]
   chatCompletions(req: ChatRequest, res: ServerResponse): Promise<boolean>
-  testModel(id: string): Promise<{ ok: boolean; error?: string }>
   removeLink?(uid: string): Promise<boolean>
   dispose(): void
 }
