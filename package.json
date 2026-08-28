@@ -3,6 +3,14 @@
   "version": "0.1.0",
   "description": "DSH plugin: TRAE SOLO supplier for dsh-router. Provides the traework supplier (free SOLO chat channel, ported from traework2api) to dsh-router through the router.suppliers cordis service.",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/CARVIN94/dsh-router-traework.git"
+  },
+  "homepage": "https://github.com/CARVIN94/dsh-router-traework#readme",
+  "bugs": {
+    "url": "https://github.com/CARVIN94/dsh-router-traework/issues"
+  },
   "main": "lib/index.js",
   "exports": {
     ".": "./lib/index.js",
@@ -41,5 +49,8 @@
     "@types/node": "^24.0.0",
     "tsdown": "^0.22.2",
     "typescript": "^5.6.0"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org"
   }
 }

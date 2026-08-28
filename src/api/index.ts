@@ -83,7 +83,6 @@ export class TraeworkSupplier implements Supplier {
   private credentials: CredentialStoreLike
   private log: (msg: string) => void
   private modelsCache: ModelInfo[] | undefined
-  private modelsFetchedAt = 0
   private pendingLogin: { machineId: string; deviceId: string } | undefined
 
   constructor(cfg: Partial<TraewConfig>, store: SupplierConfigStoreLike, credentials: CredentialStoreLike, log?: (msg: string) => void) {
@@ -160,8 +159,8 @@ export class TraeworkSupplier implements Supplier {
   // 可用模型管理（启用/禁用/自定义/别名 → 通用层 SupplierConfigStore）
   // -------------------------------------------------------------------------
 
-  /** 模型列表 TTL：超过则重新从上游拉取（数据不内置，接口获取）。 */
-  private static MODELS_TTL_MS = 60_000
+  // 模型列表：每次从上游拉取（不主动缓存——缓存由 dsh-router 核心统一管，
+  // 插件只在拉取失败时回退上次成功结果，避免面板空模型）。
 
   /** 上游拉取的模型 + 自定义模型（面板/路由共用）。无缓存时仅自定义。 */
   private allModels(): ModelInfo[] {
@@ -180,11 +179,7 @@ export class TraeworkSupplier implements Supplier {
   }
 
   listModels(force = false): ModelInfo[] | Promise<ModelInfo[]> {
-    const stale = !this.modelsCache || Date.now() - this.modelsFetchedAt > TraeworkSupplier.MODELS_TTL_MS
-    if (force || stale) {
-      return this.refreshFromUpstream().then(() => this.allModels())
-    }
-    return this.allModels()
+    return this.refreshFromUpstream().then(() => this.allModels())
   }
 
   /** 从上游拉取模型列表（接口获取，不内置数据）。失败静默回退缓存/空。 */
@@ -202,7 +197,6 @@ export class TraeworkSupplier implements Supplier {
       }
       if (fetched.length > 0) {
         this.modelsCache = fetched
-        this.modelsFetchedAt = Date.now()
       }
     } catch {
       // 拉取失败回退缓存/空
