@@ -45,8 +45,10 @@ function mapModel(model: string, known: Set<string>, defaultModel: string): stri
   model = model.trim()
   if (model === '' || model === 'auto') return defaultModel
   let base = model
-  // 支持全名 alias/id：剥掉前缀取 id 部分
-  const slash = base.lastIndexOf('/')
+  // 支持全名 alias/id：剥掉前缀取 id 部分。
+  // 用 indexOf 而非 lastIndexOf：模型 id 本身可含斜杠（如 org/name），
+  // 剥最后一段会连命名空间一起吃掉，请求必然 404。
+  const slash = base.indexOf('/')
   if (slash >= 0) base = base.slice(slash + 1)
   const i = base.indexOf('__')
   if (i >= 0) base = base.slice(0, i)
