@@ -5,10 +5,9 @@
  * dsh-router 加载。通用能力（连接池/模型管理/别名/签到规则/凭证）由 dsh-router
  * 核心统一管（env 注入），这里只暴露差异化方法。
  */
-import type { ServerResponse } from 'node:http'
 import { TraeworkSupplier } from './index.ts'
-import type { SupplierEnv, SupplierModule } from '../contract.ts'
-import type { ModelInfo, SupplierStatus, ChatRequest } from '../types.ts'
+import type { ChatOnceResult, SupplierEnv, SupplierModule, SupplierStatusNow } from '../contract.ts'
+import type { ModelInfo, ChatRequest } from '../types.ts'
 
 export const id = 'traework'
 export const name = 'traework'
@@ -36,11 +35,11 @@ export default function factory(env: SupplierEnv): SupplierModule & { removeLink
     name,
     priority,
     icon,
-    status: (): SupplierStatus => instance!.status(),
+    status: (): SupplierStatusNow => instance!.status(),
     listModels: (force?: boolean): ModelInfo[] | Promise<ModelInfo[]> => instance!.listModels(force),
     getAlias: (): string => instance!.getAlias(),
     lastError: (): string | undefined => instance!.lastError(),
-    chatCompletions: (req: ChatRequest, res: ServerResponse): Promise<boolean> => instance!.chatCompletions(req, res),
+    chatOnce: (uid: string, req: ChatRequest): Promise<ChatOnceResult> => instance!.chatOnce(uid, req),
     dispose: (): void => instance!.dispose(),
     generateLoginUrl: (): string => instance!.generateLoginUrl(),
     completeLogin: (url: string): Promise<{ uid: string; nickname: string }> => instance!.completeLogin(url),

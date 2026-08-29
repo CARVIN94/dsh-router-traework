@@ -70,10 +70,9 @@ export class Scheduler {
     this.cfg.log?.(`[dsh-router traework scheduler] ${msg}`)
   }
 
-  /** 立即对所有账号刷新 token；session 失效的自动禁用。 */
+  /** 立即对所有账号刷新 token（session 失效的体现由 chatOnce 报告给核心）。 */
   runRefreshNow(): void {
     for (const st of this.cfg.pool.list()) {
-      if (st.disabled) continue
       const a = this.cfg.pool.authByUID(st.uid)
       if (!a || refreshTokenValue(a) === '') continue
       if (!needsRefresh(a, this.cfg.refreshSkewMs)) continue
@@ -82,9 +81,8 @@ export class Scheduler {
         .then(() => this.cfg.saveAuth(a))
         .then(() => this.log(`refresh ${st.uid}: ok`))
         .catch((err: unknown) => {
+          // 只记日志：禁用是核心的策略，这里不替它决定
           this.log(`refresh ${st.uid}: ${(err as Error).message}`)
-          const ue = err as { kind?: string }
-          if (ue.kind === 'session_dead') this.cfg.pool.disable(st.uid, 'session dead')
         })
     }
   }
@@ -92,7 +90,6 @@ export class Scheduler {
   /** 立即对所有账号执行签到 + 积分刷新 + 解冻。 */
   runCheckinNow(): void {
     for (const st of this.cfg.pool.list()) {
-      if (st.disabled) continue
       this.checkinOne(st.uid)
     }
   }
@@ -102,7 +99,7 @@ export class Scheduler {
    *  仅 !checkedIn && enable 才 claim（claim HTTP 200 即成功，业务判定靠 status）。 */
   async checkinOne(uid: string): Promise<{ ok: boolean; status: 'ok' | 'already' | 'disabled' | 'error'; message?: string }> {
     const st = this.cfg.pool.list().find((s) => s.uid === uid)
-    if (st === undefined || st.disabled) return { ok: false, status: 'disabled', message: '链接不可用或已禁用' }
+    if (st === undefined) return { ok: false, status: 'error', message: '链接不存在' }
     const a = this.cfg.pool.authByUID(uid)
     if (!a || refreshTokenValue(a) === '') return { ok: false, status: 'error', message: '凭证缺失' }
     try {
@@ -110,7 +107,7 @@ export class Scheduler {
       if (status.checkedIn) {
         // 今日已签到（traework 服务端 1 天 1 次）
         const remain = await this.cfg.client.userEntUsage(a)
-        this.cfg.pool.reenableIfCredits(uid, remain)
+        this.cfg.pool.setCreditsAfterCheckin(uid, remain)
         return { ok: true, status: 'already', message: '今日已签到' }
       }
       if (!status.enable) {
@@ -119,7 +116,7 @@ export class Scheduler {
       const claimed = await this.cfg.client.checkinClaim(a)
       this.log(`checkin ${uid}: ${claimed}`)
       const remain = await this.cfg.client.userEntUsage(a)
-      this.cfg.pool.reenableIfCredits(uid, remain)
+      this.cfg.pool.setCreditsAfterCheckin(uid, remain)
       // 上游按设备判重：已签到是幂等成功，不是失败
       return claimed === 'already'
         ? { ok: true, status: 'already', message: '今日已签到' }

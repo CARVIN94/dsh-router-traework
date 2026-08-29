@@ -25,7 +25,8 @@ import {
 } from './upstream.ts'
 import { Scheduler } from './scheduler.ts'
 import { buildLoginUrl, parseLoginCallback, randomId } from './login.ts'
-import type { Supplier, SupplierStatus, SupplierAccount, ModelInfo, ModelWithEnabled, ChatRequest } from '../types.ts'
+import type { Supplier, ModelInfo, ModelWithEnabled, ChatRequest } from '../types.ts'
+import type { AccountState, ChatOnceResult, SupplierStatusNow } from '../contract.ts'
 
 function openAIError(code: string, msg: string): Record<string, unknown> {
   return { error: { message: msg, type: 'api_error', code } }
@@ -89,7 +90,7 @@ export class TraeworkSupplier implements Supplier {
   private credentials: CredentialStoreLike
   private log: (msg: string) => void
   private modelsCache: ModelInfo[] | undefined
-  /** 上次 chatCompletions 失败原因（供核心测试模型汇总诊断）。 */
+  /** 上次 chatOnce 失败原因（供核心测试模型汇总诊断）。 */
   private lastErrText: string | undefined
   private pendingLogin: { machineId: string; deviceId: string } | undefined
 
@@ -153,7 +154,7 @@ export class TraeworkSupplier implements Supplier {
     this.scheduler.stop()
   }
 
-  status(): SupplierStatus {
+  status(): SupplierStatusNow {
     this.refreshCreditsIfStale()
     return {
       id: this.id,
@@ -167,7 +168,6 @@ export class TraeworkSupplier implements Supplier {
   private refreshCreditsIfStale(): void {
     const now = Date.now()
     for (const st of this.pool.list()) {
-      if (st.disabled) continue
       if (now - (this.creditsAt.get(st.uid) ?? 0) <= TraeworkSupplier.CREDITS_TTL_MS) continue
       const a = this.pool.authByUID(st.uid)
       if (!a) continue
@@ -211,7 +211,7 @@ export class TraeworkSupplier implements Supplier {
 
   /** 从上游拉取模型列表（接口获取，不内置数据）。失败静默回退缓存/空。 */
   private async refreshFromUpstream(): Promise<void> {
-    const acct = this.pool.pick()
+    const acct = this.pool.authByUID(this.pool.list()[0]?.uid ?? '')
     if (!acct) return
     try {
       const models = await this.client.fetchModels(acct)
@@ -392,18 +392,22 @@ export class TraeworkSupplier implements Supplier {
   // chat
   // -------------------------------------------------------------------------
 
-  async chatCompletions(req: ChatRequest, res: ServerResponse): Promise<boolean> {
-    // mapModel
+  /**
+   * 对**单个账号**调一次上游。选号/冷却/禁用/换号是核心的活（AccountPool），
+   * 这里只负责：token 刷新 + 上游协议调用/转换，并报告结果。
+   */
+  async chatOnce(uid: string, req: ChatRequest): Promise<ChatOnceResult> {
     const configName = mapModel(req.model, this.allKnownIds(), this.cfg.defaultModel)
     if (configName === undefined) {
-      // 不是本供应商的模型：返回 false 让路由器尝试下一个供应商（不霸占响应）
+      // 不是本供应商的模型：交给下一个供应商
       this.lastErrText = `unknown model ${JSON.stringify(req.model)}`
-      return false
+      return { ok: false, state: 'unavailable', message: this.lastErrText }
     }
     if (this.store.get(this.id).disabled.includes(configName)) {
-      writeJson(res, 400, openAIError('model_disabled', `model ${JSON.stringify(configName)} is disabled`))
-      return true
+      this.lastErrText = `model ${JSON.stringify(configName)} is disabled`
+      return { ok: false, state: 'unavailable', message: this.lastErrText }
     }
+
     let body = req.rawBody
     try {
       const obj = JSON.parse(body) as Record<string, unknown>
@@ -413,184 +417,160 @@ export class TraeworkSupplier implements Supplier {
       // 保持原样
     }
 
-    const tried = new Set<string>()
-    let lastErr: Error | undefined
-    for (let i = 0; i < 3; i++) {
-      const acct = this.pool.pickExcluding(tried)
-      if (!acct) break
-      tried.add(acct.uid)
-
-      // token 临近过期 → 先 refresh（失败冷却换号）
-      try {
-        const refreshed = await this.client.refreshTokenIfNeeded(acct, this.cfg.refreshSkewMs)
-        if (refreshed) this.saveAuth(acct)
-      } catch (err) {
-        lastErr = err as Error
-        const ue = err as { kind?: string }
-        if (ue.kind === 'session_dead') this.pool.disable(acct.uid, 'refresh session dead')
-        else this.pool.cooldown(acct.uid, 'error_threshold', this.cfg.errCooldownMs, `refresh: ${(err as Error).message}`)
-        continue
-      }
-
-      let streamRes: { body: ReadableStream<Uint8Array> | null; status: number; respBody: string }
-      try {
-        streamRes = await this.client.chatStream(acct, body)
-      } catch (err) {
-        lastErr = err as Error
-        this.pool.noteError(acct.uid, this.cfg.errThreshold, this.cfg.errCooldownMs)
-        continue
-      }
-      if (streamRes.status >= 400) {
-        const kind = classify(streamRes.status, streamRes.respBody)
-        switch (kind) {
-          case 'plan_limit':
-            this.pool.cooldown(acct.uid, 'plan_limit', this.cfg.planCooldownMs, 'plan 权益不足')
-            break
-          case 'soft_rate':
-            this.pool.cooldown(acct.uid, 'soft_rate', this.cfg.softCooldownMs, '429 rate limit')
-            break
-          case 'session_dead':
-            this.pool.disable(acct.uid, 'session dead')
-            break
-          case 'not_found':
-            this.pool.cooldown(acct.uid, 'soft_rate', this.cfg.softCooldownMs, 'upstream 404')
-            break
-          default:
-            this.pool.noteError(acct.uid, this.cfg.errThreshold, this.cfg.errCooldownMs)
-        }
-        lastErr = new UpstreamError(kind, streamRes.status, streamRes.respBody)
-        continue
-      }
-
-      if (req.stream) {
-        this.pool.noteSuccess(acct.uid)
-        await this.streamResponse(res, streamRes.body!, (se) => this.handleStreamError(acct.uid, se))
-        return true
-      }
-
-      const { response, error } = await aggregate(linesFromStream(streamRes.body!))
-      if (error) {
-        lastErr = error
-        this.handleStreamError(acct.uid, error)
-        continue
-      }
-      // 上游空响应（无 content/reasoning/tool_calls）：视为失败，继续 fallback
-      const msg = (response as { choices?: Array<{ message?: Record<string, unknown> }> })?.choices?.[0]?.message
-      const hasContent =
-        typeof msg?.content === 'string' && msg.content.length > 0 ||
-        typeof msg?.reasoning_content === 'string' && msg.reasoning_content.length > 0 ||
-        Array.isArray(msg?.tool_calls) && msg.tool_calls.length > 0
-      if (!hasContent) {
-        lastErr = new Error('upstream returned empty response')
-        this.pool.noteError(acct.uid, this.cfg.errThreshold, this.cfg.errCooldownMs)
-        continue
-      }
-      this.pool.noteSuccess(acct.uid)
-      writeJson(res, 200, response)
-      return true
+    const acct = this.pool.authByUID(uid)
+    if (acct === undefined) {
+      this.lastErrText = `unknown account ${JSON.stringify(uid)}`
+      return { ok: false, state: 'unavailable', message: this.lastErrText }
     }
 
-    // 所有账号尝试失败：不写响应，返回 false 让路由器继续 fallback（组合回退到下一个模型/供应商）
-    if (lastErr) {
-      this.lastErrText = lastErr.message
-      this.log(`traework chat failed: ${lastErr.message}`)
+    // token 临近过期 → 先 refresh（过期=这个号现在不可用，核心会按 session_dead 处理）
+    try {
+      const refreshed = await this.client.refreshTokenIfNeeded(acct, this.cfg.refreshSkewMs)
+      if (refreshed) this.saveAuth(acct)
+    } catch (err) {
+      this.lastErrText = `refresh: ${(err as Error).message}`
+      const ue = err as { kind?: string }
+      return { ok: false, state: ue.kind === 'session_dead' ? 'session_dead' : 'transport', message: this.lastErrText }
     }
-    return false
+
+    let streamRes: { body: ReadableStream<Uint8Array> | null; status: number; respBody: string }
+    try {
+      streamRes = await this.client.chatStream(acct, body)
+    } catch (err) {
+      this.lastErrText = (err as Error).message
+      return { ok: false, state: 'transport', message: this.lastErrText }
+    }
+
+    if (streamRes.status >= 400) {
+      const kind = classify(streamRes.status, streamRes.respBody)
+      this.lastErrText = new UpstreamError(kind, streamRes.status, streamRes.respBody).message
+      return { ok: false, state: this.stateOf(kind), message: this.lastErrText }
+    }
+    if (streamRes.body === null) {
+      this.lastErrText = 'traework upstream: empty stream body'
+      return { ok: false, state: 'transport', message: this.lastErrText }
+    }
+
+    // 流式：SOLO SSE → OpenAI SSE 后交回核心写（响应头已写即绑死，见核心注释）
+    if (req.stream) {
+      // 流中途出错也要让核心记账（作用于后续请求）
+      return { ok: true, stream: this.soloToOpenAI(streamRes.body, (se) => this.noteMidStream(uid, se)) }
+    }
+
+    // 非流式：聚合后判空——空响应视为失败，让核心换号/换模型回退
+    const { response, error } = await aggregate(linesFromStream(streamRes.body))
+    if (error) {
+      this.lastErrText = error.message
+      this.noteMidStream(uid, error)
+      return { ok: false, state: this.stateOf(error.kind()), message: this.lastErrText }
+    }
+    const msg = (response as { choices?: Array<{ message?: Record<string, unknown> }> })?.choices?.[0]?.message
+    const hasContent =
+      typeof msg?.content === 'string' && msg.content.length > 0 ||
+      typeof msg?.reasoning_content === 'string' && msg.reasoning_content.length > 0 ||
+      Array.isArray(msg?.tool_calls) && msg.tool_calls.length > 0
+    if (!hasContent) {
+      this.lastErrText = 'upstream returned empty response'
+      return { ok: false, state: 'unknown', message: this.lastErrText }
+    }
+    return { ok: true, status: 200, body: JSON.stringify(response) }
   }
 
-  private handleStreamError(uid: string, se: SoloStreamError): void {
+  /** 上游错误种类 → 契约语义状态（核心据此决定冷却/禁用/换号）。 */
+  private stateOf(kind: string): AccountState {
+    switch (kind) {
+      case 'plan_limit': return 'quota'
+      case 'soft_rate': return 'rate_limit'
+      case 'session_dead': return 'session_dead'
+      case 'not_found': return 'unavailable'
+      default: return 'unknown'
+    }
+  }
+
+  /** 流中途/聚合时才发现的错误：核心已提交响应，这里只记日志（核心的池管不了已提交的流）。 */
+  private noteMidStream(uid: string, se: SoloStreamError): void {
+    void uid
     if (se.kind() === 'plan_limit') {
-      this.pool.cooldown(uid, 'plan_limit', this.cfg.planCooldownMs, 'plan 权益不足')
-    } else {
-      this.pool.noteError(uid, this.cfg.errThreshold, this.cfg.errCooldownMs)
+      this.log(`traework: account plan limit (mid-stream): ${se.message}`)
     }
   }
 
-  /** 流式响应：SOLO SSE → OpenAI SSE chunk，每 chunk flush，保证至少一个 [DONE]。 */
-  private async streamResponse(
-    res: ServerResponse,
+
+  /**
+   * SOLO SSE → OpenAI SSE 转换（纯协议转换，**不写 res**）。
+   * 返回 OpenAI 格式的流交回核心写；流中途的上游错误通过 onErr 回调暴露——
+   * 此时响应头已写出（流式一旦开始就绑死），核心收到错误只能作用于**后续**请求。
+   */
+  private soloToOpenAI(
     stream: ReadableStream<Uint8Array>,
-    onErr: (se: SoloStreamError) => void,
-  ): Promise<void> {
-    res.writeHead(200, {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      Connection: 'keep-alive',
-      'X-Accel-Buffering': 'no',
-    })
-    const flush = (): void => {
-      if (typeof (res as { flushHeaders?: () => void }).flushHeaders === 'function') {
-        ;(res as { flushHeaders: () => void }).flushHeaders()
-      }
-    }
+    onErr?: (se: SoloStreamError) => void,
+  ): ReadableStream<Uint8Array> {
+    const enc = new TextEncoder()
     const id = `chatcmpl-${Date.now()}`
-    let pendingUsage: Record<string, unknown> | null = null
-    let sawDone = false
-
-    const writeChunk = (delta: Record<string, unknown>, finish: string): Promise<boolean> => {
-      const chunk: Record<string, unknown> = {
-        id,
-        object: 'chat.completion.chunk',
-        created: Math.floor(Date.now() / 1000),
-        model: '',
-        choices: [{ index: 0, delta }],
-      }
-      if (finish !== '') (chunk.choices as unknown[])[0] = { ...(chunk.choices as unknown[])[0] as Record<string, unknown>, finish_reason: finish }
-      if (pendingUsage) {
-        chunk.usage = pendingUsage
-        pendingUsage = null
-      }
-      return new Promise((resolve) => {
-        const ok = res.write(`data: ${JSON.stringify(chunk)}\n\n`)
-        flush()
-        resolve(ok)
-      })
-    }
-    const writeDONE = (): Promise<boolean> => {
-      return new Promise((resolve) => {
-        const ok = res.write('data: [DONE]\n\n')
-        flush()
-        resolve(ok)
-      })
-    }
-
-    const st = { event: '', data: '' }
-    for await (const rawLine of linesFromStream(stream)) {
-      const line = rawLine.replace(/\r?$/, '')
-      const ev = scanLine(st, line)
-      if (!ev) continue
-      switch (ev.event) {
-        case 'output': {
-          const delta: Record<string, unknown> = {}
-          if (ev.response !== '') delta.content = ev.response
-          if (ev.reasoning !== '') delta.reasoning_content = ev.reasoning
-          if (ev.toolCalls !== null && ev.toolCalls !== 'null') {
-            const tc = normalizeToolCalls(ev.toolCalls)
-            if (tc.length > 0) delta.tool_calls = tc
+    return new ReadableStream<Uint8Array>({
+      start: async (ctrl) => {
+        const chunk = (delta: Record<string, unknown>, finish: string, usage: Record<string, unknown> | null): void => {
+          const c: Record<string, unknown> = {
+            id,
+            object: 'chat.completion.chunk',
+            created: Math.floor(Date.now() / 1000),
+            model: '',
+            choices: [{ index: 0, delta }],
           }
-          if (Object.keys(delta).length > 0) await writeChunk(delta, '')
-          break
+          if (finish !== '') {
+            c.choices = [{ index: 0, delta, finish_reason: finish }]
+          }
+          if (usage) c.usage = usage
+          ctrl.enqueue(enc.encode(`data: ${JSON.stringify(c)}\n\n`))
         }
-        case 'token_usage':
-          pendingUsage = ev.usage
-          break
-        case 'done':
-          await writeChunk({}, ev.finishReason)
-          await writeDONE()
+        let pendingUsage: Record<string, unknown> | null = null
+        let sawDone = false
+        const done = (): void => {
+          ctrl.enqueue(enc.encode('data: [DONE]\n\n'))
           sawDone = true
-          break
-        case 'error': {
-          const se = new SoloStreamError(ev.errorCode, ev.errorMessage)
-          onErr(se)
-          res.write(`event: error\ndata: ${JSON.stringify(`solo error code=${ev.errorCode} msg=${ev.errorMessage}`)}\n\n`)
-          await writeDONE()
-          sawDone = true
-          break
         }
-      }
-    }
-    if (!sawDone) await writeDONE()
-    res.end()
+        try {
+          const st = { event: '', data: '' }
+          for await (const rawLine of linesFromStream(stream)) {
+            const ev = scanLine(st, rawLine.replace(/\r?$/, ''))
+            if (!ev) continue
+            switch (ev.event) {
+              case 'output': {
+                const delta: Record<string, unknown> = {}
+                if (ev.response !== '') delta.content = ev.response
+                if (ev.reasoning !== '') delta.reasoning_content = ev.reasoning
+                if (ev.toolCalls !== null && ev.toolCalls !== 'null') {
+                  const tc = normalizeToolCalls(ev.toolCalls)
+                  if (tc.length > 0) delta.tool_calls = tc
+                }
+                if (Object.keys(delta).length > 0) chunk(delta, '', null)
+                break
+              }
+              case 'token_usage':
+                pendingUsage = ev.usage
+                break
+              case 'done':
+                chunk({}, ev.finishReason, pendingUsage)
+                done()
+                break
+              case 'error': {
+                onErr?.(new SoloStreamError(ev.errorCode, ev.errorMessage))
+                ctrl.enqueue(enc.encode(`event: error\ndata: ${JSON.stringify(`solo error code=${ev.errorCode} msg=${ev.errorMessage}`)}\n\n`))
+                done()
+                break
+              }
+            }
+          }
+          if (!sawDone) done()
+        } catch (err) {
+          // 上游断流：也要给客户端一个收尾，否则客户端一直等
+          onErr?.(new SoloStreamError(-1, (err as Error).message))
+          if (!sawDone) done()
+        } finally {
+          ctrl.close()
+        }
+      },
+    })
   }
 
   // -------------------------------------------------------------------------
@@ -599,7 +579,6 @@ export class TraeworkSupplier implements Supplier {
 
   private refreshCredits(): void {
     for (const st of this.pool.list()) {
-      if (st.disabled) continue
       const a = this.pool.authByUID(st.uid)
       if (!a) continue
       this.client.userEntUsage(a).then(
