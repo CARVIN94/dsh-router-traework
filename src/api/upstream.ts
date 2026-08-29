@@ -19,6 +19,9 @@ export type ErrKind =
   | 'server' // 5xx
   | 'client' // 其他 4xx
 
+/** 签到业务码：该设备今日已签到（幂等，按成功处理）。 */
+const CHECKIN_ALREADY_CODE = 9095
+
 export class UpstreamError extends Error {
   kind: ErrKind
   status: number
@@ -586,15 +589,18 @@ export class SoloClient {
     return { checkedIn: !!r.checked_in, credits: Number(r.credits ?? 0), enable: !!r.enable }
   }
 
-  /** 执行签到。上游限流/未开放时是 HTTP 200 + 业务 code（实测 9074「当前参与用户太多」），
-   *  只看 HTTP 状态会误报成功——积分没变，用户却看到「签到成功」。 */
-  async checkinClaim(a: Auth): Promise<void> {
+  /** 执行签到。成功与否看**业务 code**而非 HTTP 状态：上游一律 200，
+   *  失败藏在 code 里（实测 9074「参与用户太多」、9090「活动暂不可用」、
+   *  9095「当前设备今日已经签到」）。只看 HTTP 会误报成功——积分没变，
+   *  用户却看到「签到成功」。
+   *  返回 'already' 表示该设备今日已签到（幂等，按成功处理）。 */
+  async checkinClaim(a: Auth): Promise<'ok' | 'already'> {
     const data = await this.doJSON(this.ugHost + SOLO.EpCheckinClaim, ugHeaders(a), {})
     const r = data as { code?: number; message?: string }
     const code = Number(r.code ?? 0)
-    if (code !== 0) {
-      throw new UpstreamError('soft_rate', 200, `${r.message ?? 'checkin failed'} (code=${code})`)
-    }
+    if (code === 0) return 'ok'
+    if (code === CHECKIN_ALREADY_CODE) return 'already'
+    throw new UpstreamError('soft_rate', 200, `${r.message ?? 'checkin failed'} (code=${code})`)
   }
 
   /** 剩余积分：聚合 (credits_limit - credits_amount)（credits_amount 是已用积分，实测）。 */

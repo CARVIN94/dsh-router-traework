@@ -116,11 +116,14 @@ export class Scheduler {
       if (!status.enable) {
         return { ok: false, status: 'disabled', message: '今日签到未开放' }
       }
-      await this.cfg.client.checkinClaim(a)
-      this.log(`checkin ${uid}: ok`)
+      const claimed = await this.cfg.client.checkinClaim(a)
+      this.log(`checkin ${uid}: ${claimed}`)
       const remain = await this.cfg.client.userEntUsage(a)
       this.cfg.pool.reenableIfCredits(uid, remain)
-      return { ok: true, status: 'ok', message: '签到成功' }
+      // 上游按设备判重：已签到是幂等成功，不是失败
+      return claimed === 'already'
+        ? { ok: true, status: 'already', message: '今日已签到' }
+        : { ok: true, status: 'ok', message: '签到成功' }
     } catch (err) {
       const message = (err as Error).message
       this.log(`checkin ${uid}: ${message}`)
