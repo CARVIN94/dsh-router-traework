@@ -590,10 +590,17 @@ export class SoloClient {
   }
 
   /** 执行签到。成功与否看**业务 code**而非 HTTP 状态：上游一律 200，
-   *  失败藏在 code 里（实测 9074「参与用户太多」、9090「活动暂不可用」、
-   *  9095「当前设备今日已经签到」）。只看 HTTP 会误报成功——积分没变，
-   *  用户却看到「签到成功」。
-   *  返回 'already' 表示该设备今日已签到（幂等，按成功处理）。 */
+   *  失败藏在 code 里。只看 HTTP 会误报成功——积分没变，用户却看到「签到成功」。
+   *
+   *  业务码（实测）：
+   *  - 0    = 成功
+   *  - 9095 = 当前**设备**今日已签到 → 幂等成功（不是失败）
+   *  - 9074 = 「参与用户太多」→ 实为风控：同一账号短时间用**多个 deviceId** 请求
+   *           会被视为异常设备。修 deviceId 无关，固定用一个 + 隔天再签即可
+   *  - 9090 = 活动暂不可用（另一套 activity/action 体系，本插件不走）
+   *
+   *  判重维度是**设备**（`x-device-id`）不是账号：所以 deviceId 必须稳定，
+   *  换 id 不只会失败，还会把账号拖进风控。 */
   async checkinClaim(a: Auth): Promise<'ok' | 'already'> {
     const data = await this.doJSON(this.ugHost + SOLO.EpCheckinClaim, ugHeaders(a), {})
     const r = data as { code?: number; message?: string }
