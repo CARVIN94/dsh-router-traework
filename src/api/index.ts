@@ -401,11 +401,11 @@ export class TraeworkSupplier implements Supplier {
     if (configName === undefined) {
       // 不是本供应商的模型：交给下一个供应商
       this.lastErrText = `unknown model ${JSON.stringify(req.model)}`
-      return { ok: false, state: 'unavailable', message: this.lastErrText }
+      return { ok: false, state: 'no_such_model', message: this.lastErrText }
     }
     if (this.store.get(this.id).disabled.includes(configName)) {
       this.lastErrText = `model ${JSON.stringify(configName)} is disabled`
-      return { ok: false, state: 'unavailable', message: this.lastErrText }
+      return { ok: false, state: 'no_such_model', message: this.lastErrText }
     }
 
     let body = req.rawBody
@@ -420,7 +420,7 @@ export class TraeworkSupplier implements Supplier {
     const acct = this.pool.authByUID(uid)
     if (acct === undefined) {
       this.lastErrText = `unknown account ${JSON.stringify(uid)}`
-      return { ok: false, state: 'unavailable', message: this.lastErrText }
+      return { ok: false, state: 'no_such_model', message: this.lastErrText }
     }
 
     // token 临近过期 → 先 refresh（过期=这个号现在不可用，核心会按 session_dead 处理）

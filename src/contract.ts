@@ -45,6 +45,10 @@ export type AccountState =
   | 'unavailable'   // 上游不可用（404 / 服务下线）
   | 'transport'     // 网络/连接层失败（没拿到 HTTP 状态）
   | 'unknown'       // 说不清是什么错
+  /** 这个模型不属于本供应商（不是账号的失败）。核心据此跳过整个供应商换下一个，
+   *  而不是记在账号头上——否则组合里每有一个别人家的模型，就会给无关账号攒
+   *  一次错误，攒够阈值把它冷却掉。 */
+  | 'no_such_model'
 
 /** 账号「现在状态」（插件只报它观察到的部分）。 */
 export interface SupplierAccountNow {
