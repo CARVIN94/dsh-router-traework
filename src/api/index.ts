@@ -230,9 +230,9 @@ export class TraeworkSupplier implements Supplier {
     }
   }
 
-  /** 供应商前缀（模型全名 = alias/id）。 */
+  /** 供应商前缀（模型全名 = alias/id）。别名留空即用供应商 id（默认值）。 */
   getAlias(): string {
-    return this.store.get(this.id).alias || 'traework'
+    return this.store.get(this.id).alias || this.id
   }
 
   /** 用户手动添加的模型 id（supplier-config custom）。 */
