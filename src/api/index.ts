@@ -103,8 +103,6 @@ export class TraeworkSupplier implements Supplier {
       getStrategy: () => this.store.get(this.id).poolStrategy,
       setOrder: (uids) => this.store.setPoolOrder(this.id, uids),
       setStrategy: (s) => this.store.setPoolStrategy(this.id, s),
-      getCheckinRule: () => this.store.get(this.id).checkinRule,
-      setCheckinRule: (r) => this.store.setCheckinRule(this.id, r),
     })
     this.client = new SoloClient({
       agentHost: this.cfg.agentHost,
@@ -266,22 +264,12 @@ export class TraeworkSupplier implements Supplier {
     return { ok: true }
   }
 
-  /** 触发签到：按 dsh-router 通用策略 all=所有链接 / first=仅首个链接。 */
-  async checkinNow(): Promise<{ ok: boolean; total: number; succeeded: number; already: number; results?: Array<{ uid: string; ok: boolean; status: string; message?: string }> }> {
-    const accounts = this.pool.list()
-    const available = accounts.filter((a) => !a.disabled)
-    if (available.length === 0) return { ok: false, total: 0, succeeded: 0, already: 0 }
-    const uids = this.pool.getCheckinRule() === 'first' ? [available[0]!.uid] : available.map((a) => a.uid)
-    const results: Array<{ uid: string; ok: boolean; status: string; message?: string }> = []
-    for (const uid of uids) {
-      const r = await this.scheduler.checkinOne(uid)
-      // scheduler 签到后会重新拉积分写回池，这里同步时间戳避免 status() 立刻重拉
-      if (r.status === 'ok' || r.status === 'already') this.creditsAt.set(uid, Date.now())
-      results.push({ uid, ...r })
-    }
-    const succeeded = results.filter((r) => r.status === 'ok').length
-    const already = results.filter((r) => r.status === 'already').length
-    return { ok: true, total: uids.length, succeeded, already, results }
+  /** 单链接签到：遍历所有链接 + 汇总是 dsh-router 核心的活，这里只签一个 uid。 */
+  async checkinNow(uid: string): Promise<{ ok: boolean; status: string; message?: string }> {
+    const r = await this.scheduler.checkinOne(uid)
+    // scheduler 签到后会重新拉积分写回池，这里同步时间戳避免 status() 立刻重拉
+    if (r.status === 'ok' || r.status === 'already') this.creditsAt.set(uid, Date.now())
+    return r
   }
 
   setAlias(alias: string): { ok: boolean; error?: string } {

@@ -7,7 +7,7 @@
 import type { ServerResponse } from 'node:http'
 import type { ChatRequest, ModelInfo, SupplierAccount, SupplierStatus } from './types.ts'
 
-/** 通用配置存储（dsh-router 核心注入；连接池/模型管理/别名/签到规则）。 */
+/** 通用配置存储（dsh-router 核心注入；连接池/模型管理/别名）。 */
 export interface SupplierConfigStoreLike {
   get(id: string): {
     alias: string
@@ -15,12 +15,10 @@ export interface SupplierConfigStoreLike {
     custom: string[]
     poolOrder: string[]
     poolStrategy: 'fallback' | 'round-robin'
-    checkinRule: 'all' | 'first'
   }
   setAlias(id: string, alias: string): void
   setPoolOrder(id: string, uids: string[]): void
   setPoolStrategy(id: string, strategy: string): void
-  setCheckinRule(id: string, rule: 'all' | 'first'): void
   setModelEnabled(id: string, modelId: string, enabled: boolean): void
   addCustomModel(id: string, modelId: string): void
   removeCustomModel(id: string, modelId: string): void
@@ -69,7 +67,9 @@ export interface SupplierModule {
   lastError?(): string | undefined
   generateLoginUrl?(): string | { ok: boolean; error?: string; loginUrl?: string }
   completeLogin?(callbackUrl: string): Promise<{ uid: string; nickname: string }>
-  checkinNow?(): Promise<{ ok: boolean; total: number; succeeded: number; already?: number; error?: string; results?: Array<{ uid: string; ok: boolean; status?: string; message?: string }> }>
+  /** 单个链接签到。遍历所有链接 + 结果汇总是 dsh-router 核心的活。
+   *  status: 'ok'(签到成功) / 'already'(今日已签到) / 'error'(失败)。 */
+  checkinNow?(uid: string): Promise<{ ok: boolean; status: string; message?: string }>
 }
 
 export type { SupplierAccount }

@@ -45,6 +45,6 @@ export default function factory(env: SupplierEnv): SupplierModule & { removeLink
     generateLoginUrl: (): string => instance!.generateLoginUrl(),
     completeLogin: (url: string): Promise<{ uid: string; nickname: string }> => instance!.completeLogin(url),
     removeLink: (uid: string): Promise<boolean> => instance!.removeLink(uid),
-    checkinNow: (): Promise<{ ok: boolean; total: number; succeeded: number; already: number; results?: Array<{ uid: string; ok: boolean; status: string; message?: string }> }> => instance!.checkinNow(),
+    checkinNow: (uid: string): Promise<{ ok: boolean; status: string; message?: string }> => instance!.checkinNow(uid),
   }
 }

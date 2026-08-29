@@ -18,17 +18,12 @@ export const COOL_KIND: Record<CoolKind, string> = {
 /** 账号选择策略，与组合策略一致。 */
 export type PoolStrategy = 'fallback' | 'round-robin'
 
-/** 签到规则：所有链接 / 仅首个链接。 */
-export type CheckinRule = 'all' | 'first'
-
 /** 外部连接池配置源（dsh-router 通用层 SupplierConfigStore）。 */
 export interface PoolConfigSource {
   getOrder: () => string[]
   getStrategy: () => PoolStrategy
   setOrder: (uids: string[]) => void
   setStrategy: (strategy: PoolStrategy) => void
-  getCheckinRule: () => CheckinRule
-  setCheckinRule: (rule: CheckinRule) => void
 }
 
 /** 单个账号对外暴露的状态（脱敏，不含 token）。 */
@@ -67,8 +62,6 @@ interface StateFile {
   order?: string[]
   /** 账号选择策略。 */
   strategy?: PoolStrategy
-  /** 签到规则。 */
-  checkinRule?: CheckinRule
 }
 
 /** 账号池。 */
@@ -78,7 +71,6 @@ export class Pool {
   private config?: PoolConfigSource
   private order: string[] = []
   private strategy: PoolStrategy = 'fallback'
-  private checkinRule: CheckinRule = 'all'
   /** round-robin 轮转游标。 */
   private rrCursor = 0
 
@@ -88,7 +80,6 @@ export class Pool {
     if (config) {
       this.order = config.getOrder()
       this.strategy = config.getStrategy()
-      this.checkinRule = config.getCheckinRule()
     }
     if (stateFp !== '') this.load()
   }
@@ -176,19 +167,6 @@ export class Pool {
     if (strategy !== 'fallback' && strategy !== 'round-robin') return
     this.strategy = strategy
     if (this.config) this.config.setStrategy(strategy)
-    else this.saveLocked()
-  }
-
-  /** 当前签到规则（all/first）。 */
-  getCheckinRule(): CheckinRule {
-    return this.checkinRule
-  }
-
-  /** 设置签到规则（all=所有链接 / first=仅首个链接）。规则是 dsh-router 通用策略。 */
-  setCheckinRule(rule: CheckinRule): void {
-    if (rule !== 'all' && rule !== 'first') return
-    this.checkinRule = rule
-    if (this.config) this.config.setCheckinRule(rule)
     else this.saveLocked()
   }
 
@@ -330,7 +308,6 @@ export class Pool {
         this.order = sf.order.filter((uid) => alive.has(uid))
       }
       if (sf.strategy === 'fallback' || sf.strategy === 'round-robin') this.strategy = sf.strategy
-      if (sf.checkinRule === 'all' || sf.checkinRule === 'first') this.checkinRule = sf.checkinRule
     }
   }
 
@@ -340,7 +317,6 @@ export class Pool {
       accounts: {},
       order: this.config ? [] : [...this.order],
       strategy: this.config ? 'fallback' : this.strategy,
-      checkinRule: this.config ? 'all' : this.checkinRule,
     }
     for (const [uid, e] of this.byUID) {
       sf.accounts[uid] = {
