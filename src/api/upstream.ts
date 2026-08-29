@@ -586,9 +586,15 @@ export class SoloClient {
     return { checkedIn: !!r.checked_in, credits: Number(r.credits ?? 0), enable: !!r.enable }
   }
 
-  /** 执行签到（HTTP 200 即成功；业务判定靠 checkinStatus 的 checked_in）。 */
+  /** 执行签到。上游限流/未开放时是 HTTP 200 + 业务 code（实测 9074「当前参与用户太多」），
+   *  只看 HTTP 状态会误报成功——积分没变，用户却看到「签到成功」。 */
   async checkinClaim(a: Auth): Promise<void> {
-    await this.doJSON(this.ugHost + SOLO.EpCheckinClaim, ugHeaders(a), {})
+    const data = await this.doJSON(this.ugHost + SOLO.EpCheckinClaim, ugHeaders(a), {})
+    const r = data as { code?: number; message?: string }
+    const code = Number(r.code ?? 0)
+    if (code !== 0) {
+      throw new UpstreamError('soft_rate', 200, `${r.message ?? 'checkin failed'} (code=${code})`)
+    }
   }
 
   /** 剩余积分：聚合 (credits_limit - credits_amount)（credits_amount 是已用积分，实测）。 */

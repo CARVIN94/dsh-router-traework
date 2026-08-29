@@ -81,6 +81,10 @@ export class TraeworkSupplier implements Supplier {
   private pool: Pool
   private client: SoloClient
   private scheduler: Scheduler
+  /** 积分拉取时间（uid → ms）：status() 同步返回池里的值，过期后台异步刷新。 */
+  private creditsAt = new Map<string, number>()
+  /** 积分缓存有效期。 */
+  private static readonly CREDITS_TTL_MS = 10 * 60 * 1000
   private store: SupplierConfigStoreLike
   private credentials: CredentialStoreLike
   private log: (msg: string) => void
@@ -152,10 +156,31 @@ export class TraeworkSupplier implements Supplier {
   }
 
   status(): SupplierStatus {
+    this.refreshCreditsIfStale()
     return {
       id: this.id,
       name: this.name,
       accounts: this.pool.list(),
+    }
+  }
+
+  /** 积分过期则后台异步刷新（不阻塞面板）：只在启动/加链接时拉一次的话，
+   *  聊天消耗和签到入账都反映不到面板上。 */
+  private refreshCreditsIfStale(): void {
+    const now = Date.now()
+    for (const st of this.pool.list()) {
+      if (st.disabled) continue
+      if (now - (this.creditsAt.get(st.uid) ?? 0) <= TraeworkSupplier.CREDITS_TTL_MS) continue
+      const a = this.pool.authByUID(st.uid)
+      if (!a) continue
+      this.creditsAt.set(st.uid, now) // 先占位，避免同一轮重复发请求
+      this.client.userEntUsage(a).then(
+        (remain) => {
+          this.pool.setCredits(st.uid, remain)
+          this.creditsAt.set(st.uid, Date.now())
+        },
+        () => this.creditsAt.delete(st.uid), // 失败：下次 status() 再试
+      )
     }
   }
 
@@ -250,6 +275,8 @@ export class TraeworkSupplier implements Supplier {
     const results: Array<{ uid: string; ok: boolean; status: string; message?: string }> = []
     for (const uid of uids) {
       const r = await this.scheduler.checkinOne(uid)
+      // scheduler 签到后会重新拉积分写回池，这里同步时间戳避免 status() 立刻重拉
+      if (r.status === 'ok' || r.status === 'already') this.creditsAt.set(uid, Date.now())
       results.push({ uid, ...r })
     }
     const succeeded = results.filter((r) => r.status === 'ok').length
