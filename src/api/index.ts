@@ -645,6 +645,12 @@ function normalizeToolCalls(raw: unknown): unknown[] {
       delete fn.namespace
       delete fn.partial_arguments
     }
+    // **没有名字的工具调用一律丢掉**：上游偶发漏发/形状不规整时会吐出
+    // 无 function 或 name 为空的 tool call，原样转发下去只能失败——下游报
+    // `unknown tool ""`，白白浪费一轮还看不出原因。丢掉比转发垃圾好：
+    // 客户端看到的是「模型没调工具」，而不是一个指向空名字的报错。
+    const name = (call.function as Record<string, unknown> | undefined)?.name
+    if (typeof name !== 'string' || name === '') continue
     out.push(call)
   }
   return out
