@@ -2,9 +2,9 @@
 
 DSH 插件：为 [dsh-router](https://github.com/CARVIN94/dsh-router) 提供 `traework` 供应商（免费 SOLO 聊天通道）。
 
-本项目是 [traework2api](https://github.com/Sliverkiss/traework2api) 的 DSH 插件版，
-上游协议与签到语义参考 [wild-work](https://github.com/rockswang/wild-work)，
-宿主参考 [dsh-router](https://github.com/CARVIN94/dsh-router)。
+本项目是 [traework2api](https://github.com/Sliverkiss/traework2api) 的 DSH 插件版,
+上游协议与签到语义参考 [wild-work](https://github.com/rockswang/wild-work);
+按 [dsh-router](https://github.com/CARVIN94/dsh-router) 的供应商契约实现,单独装它没用。
 
 ## 安装(DSH)
 
@@ -75,9 +75,7 @@ src/
   直接移植来源：上游客户端、登录流程、定时任务与常量表都来自它;
 - [rockswang/wild-work](https://github.com/rockswang/wild-work) —— 签到语义的参考:
   `checkin_credits` 的业务码含义、以及「成败只看 body code、积分不能当凭据」
-  这些判定规则的来源;
-- [CARVIN94/dsh-router](https://github.com/CARVIN94/dsh-router) —— 宿主核心:
-  供应商契约、账号池策略与面板都来自它,本插件只是按契约实现一个供应商。
+  这些判定规则的来源。
 
 ## License
 
