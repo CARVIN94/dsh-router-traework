@@ -94,9 +94,13 @@ export class Scheduler {
     }
   }
 
-  /** 对单个账号执行签到。真实语义（参考 traework2api）：
+  /** 对单个账号执行签到。真实语义（参考 traework2api / wild-work）：
    *  status 判定：checked_in=true → 今日已签；!enable → 未开放；
-   *  仅 !checkedIn && enable 才 claim（claim HTTP 200 即成功，业务判定靠 status）。 */
+   *  仅 !checkedIn && enable 才 claim，claim 后**重查 status 确认**才算成功。
+   *
+   *  为什么必须回查：积分（user_ent_usage）是**所有包**的聚合剩余额度，
+   *  实测某账号签到前后都是同一个数——拿它判成败会谎报「签到成功」。
+   *  只有 status.checked_in 是这次签到的真凭据。 */
   async checkinOne(uid: string): Promise<{ ok: boolean; status: 'ok' | 'already' | 'disabled' | 'error'; message?: string }> {
     const st = this.cfg.pool.list().find((s) => s.uid === uid)
     if (st === undefined) return { ok: false, status: 'error', message: '链接不存在' }
@@ -105,9 +109,8 @@ export class Scheduler {
     try {
       const status = await this.cfg.client.checkinStatus(a)
       if (status.checkedIn) {
-        // 今日已签到（traework 服务端 1 天 1 次）
-        const remain = await this.cfg.client.userEntUsage(a)
-        this.cfg.pool.setCreditsAfterCheckin(uid, remain)
+        await this.refreshCredits(uid, a)
+        // 今日已签到（traework 服务端 1 天 1 次），幂等成功
         return { ok: true, status: 'already', message: '今日已签到' }
       }
       if (!status.enable) {
@@ -115,9 +118,13 @@ export class Scheduler {
       }
       const claimed = await this.cfg.client.checkinClaim(a)
       this.log(`checkin ${uid}: ${claimed}`)
-      const remain = await this.cfg.client.userEntUsage(a)
-      this.cfg.pool.setCreditsAfterCheckin(uid, remain)
-      // 上游按设备判重：已签到是幂等成功，不是失败
+      // 回查：claim 返回 0 也不代表真签上了，checked_in 才是凭据
+      const after = await this.cfg.client.checkinStatus(a)
+      await this.refreshCredits(uid, a)
+      if (!after.checkedIn) {
+        return { ok: false, status: 'error', message: '签到未生效：上游未标记已签到' }
+      }
+      // 上游按账号判重：已签到是幂等成功，不是失败
       return claimed === 'already'
         ? { ok: true, status: 'already', message: '今日已签到' }
         : { ok: true, status: 'ok', message: '签到成功' }
@@ -125,6 +132,15 @@ export class Scheduler {
       const message = (err as Error).message
       this.log(`checkin ${uid}: ${message}`)
       return { ok: false, status: 'error', message }
+    }
+  }
+
+  /** 刷新积分（失败不阻断——积分只供面板显示，不是签到成败的凭据）。 */
+  private async refreshCredits(uid: string, a: Auth): Promise<void> {
+    try {
+      this.cfg.pool.setCreditsAfterCheckin(uid, await this.cfg.client.userEntUsage(a))
+    } catch (err) {
+      this.log(`checkin ${uid}: 积分刷新失败 ${(err as Error).message}`)
     }
   }
 }

@@ -33,6 +33,7 @@
   ],
   "scripts": {
     "build": "rm -rf lib && tsdown",
+    "test": "node --test \"src/**/*.test.ts\"",
     "typecheck": "tsc --noEmit"
   },
   "license": "MIT",

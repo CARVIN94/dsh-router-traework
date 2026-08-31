@@ -19,8 +19,11 @@ export type ErrKind =
   | 'server' // 5xx
   | 'client' // 其他 4xx
 
-/** 签到业务码：该设备今日已签到（幂等，按成功处理）。 */
+/** 签到业务码：今日已签到（幂等，按成功处理）。 */
 const CHECKIN_ALREADY_CODE = 9095
+
+/** 签到业务码：「当前参与用户太多」——短时风控抖动，等一下重试即可。 */
+const CHECKIN_BUSY_CODE = 9074
 
 export class UpstreamError extends Error {
   kind: ErrKind
@@ -449,6 +452,10 @@ export interface SoloClientOptions {
   timeoutSeconds?: number
   /** fetch 实现（默认全局 fetch；测试注入）。 */
   fetchImpl?: typeof fetch
+  /** 签到遇 9074 后的重试等待；生产默认 8s，测试注入 0 免等待。 */
+  checkinRetryDelayMs?: number
+  /** 可注入的 sleep（测试免等待）。 */
+  sleep?: (ms: number) => Promise<void>
 }
 
 /** SOLO 上游 HTTP 客户端。 */
@@ -458,6 +465,8 @@ export class SoloClient {
   private oauthHost: string
   private timeoutSeconds: number
   private fetchImpl: typeof fetch
+  private checkinRetryDelayMs: number
+  private sleepImpl: (ms: number) => Promise<void>
 
   constructor(opts: SoloClientOptions = {}) {
     this.agentHost = opts.agentHost ?? SOLO.AgentHost
@@ -465,6 +474,8 @@ export class SoloClient {
     this.oauthHost = opts.oauthHost ?? SOLO.OAuthHost
     this.timeoutSeconds = opts.timeoutSeconds ?? 120
     this.fetchImpl = opts.fetchImpl ?? globalThis.fetch.bind(globalThis)
+    this.checkinRetryDelayMs = opts.checkinRetryDelayMs ?? 8000
+    this.sleepImpl = opts.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)))
   }
 
   /** 发短 JSON 请求并解 JSON；非 2xx 返回 *UpstreamError。 */
@@ -582,32 +593,44 @@ export class SoloClient {
     return out
   }
 
-  /** 查询签到状态。 */
+  /** 查询签到状态。业务 code 非 0 也报错——上游一律 200，成败只在 code 里。 */
   async checkinStatus(a: Auth): Promise<{ checkedIn: boolean; credits: number; enable: boolean }> {
     const data = await this.doJSON(this.ugHost + SOLO.EpCheckinStatus, ugHeaders(a), {})
-    const r = data as { checked_in?: boolean; credits?: number; enable?: boolean }
+    const r = data as { checked_in?: boolean; credits?: number; enable?: boolean; code?: number; message?: string; msg?: string }
+    const code = Number(r.code ?? 0)
+    if (code !== 0) throw new UpstreamError('soft_rate', 200, `${r.message ?? r.msg ?? 'checkin status failed'} (code=${code})`)
     return { checkedIn: !!r.checked_in, credits: Number(r.credits ?? 0), enable: !!r.enable }
   }
 
   /** 执行签到。成功与否看**业务 code**而非 HTTP 状态：上游一律 200，
    *  失败藏在 code 里。只看 HTTP 会误报成功——积分没变，用户却看到「签到成功」。
    *
-   *  业务码（实测）：
+   *  业务码（2026-08-31 实测）：
    *  - 0    = 成功
-   *  - 9095 = 当前**设备**今日已签到 → 幂等成功（不是失败）
-   *  - 9074 = 「参与用户太多」→ 实为风控：同一账号短时间用**多个 deviceId** 请求
-   *           会被视为异常设备。修 deviceId 无关，固定用一个 + 隔天再签即可
+   *  - 9095 = 今日已签到 → 幂等成功（不是失败）
+   *  - 9074 = 「参与用户太多」→ **短时风控抖动，重试即可过**（默认等 8s 重试一次）。
+   *           实测：同一账号连发 25 次全成功，换成新 deviceId 也照样成功、再换回旧 id
+   *           同样成功——所以 9074 既不是 deviceId 格式问题也不是频率问题，
+   *           不重试就等于当天签到直接废掉（调度器一天只跑一次）。
    *  - 9090 = 活动暂不可用（另一套 activity/action 体系，本插件不走）
    *
-   *  判重维度是**设备**（`x-device-id`）不是账号：所以 deviceId 必须稳定，
-   *  换 id 不只会失败，还会把账号拖进风控。 */
+   *  判重维度是**账号**不是设备（实测：换新 deviceId 后 checked_in 仍为 true），
+   *  所以「已签到」是幂等成功。deviceId 依然要稳定——它参与上游风控画像，
+   *  但**不必**为了绕过 9074 去换 id。 */
   async checkinClaim(a: Auth): Promise<'ok' | 'already'> {
-    const data = await this.doJSON(this.ugHost + SOLO.EpCheckinClaim, ugHeaders(a), {})
-    const r = data as { code?: number; message?: string }
-    const code = Number(r.code ?? 0)
-    if (code === 0) return 'ok'
-    if (code === CHECKIN_ALREADY_CODE) return 'already'
-    throw new UpstreamError('soft_rate', 200, `${r.message ?? 'checkin failed'} (code=${code})`)
+    for (let attempt = 0; ; attempt++) {
+      const data = await this.doJSON(this.ugHost + SOLO.EpCheckinClaim, ugHeaders(a), {})
+      const r = data as { code?: number; message?: string; msg?: string }
+      const code = Number(r.code ?? 0)
+      if (code === 0) return 'ok'
+      if (code === CHECKIN_ALREADY_CODE) return 'already'
+      const msg = `${r.message ?? r.msg ?? 'checkin failed'} (code=${code})`
+      if (code === CHECKIN_BUSY_CODE && attempt === 0) {
+        await this.sleepImpl(this.checkinRetryDelayMs)
+        continue
+      }
+      throw new UpstreamError('soft_rate', 200, msg)
+    }
   }
 
   /** 剩余积分：聚合 (credits_limit - credits_amount)（credits_amount 是已用积分，实测）。 */
