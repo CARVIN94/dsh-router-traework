@@ -2,7 +2,9 @@
 
 DSH 插件：为 [dsh-router](https://github.com/CARVIN94/dsh-router) 提供 `traework` 供应商（免费 SOLO 聊天通道）。
 
-本项目是 [traework2api](https://github.com/Sliverkiss/traework2api) 的 DSH 插件版，上游参考 [dsh-router](https://github.com/CARVIN94/dsh-router)。
+本项目是 [traework2api](https://github.com/Sliverkiss/traework2api) 的 DSH 插件版，
+上游协议与签到语义参考 [wild-work](https://github.com/rockswang/wild-work)，
+宿主参考 [dsh-router](https://github.com/CARVIN94/dsh-router)。
 
 ## 安装(DSH)
 
@@ -44,7 +46,7 @@ src/
   `transport` / `unknown`），由核心决定冷却多久、是否禁用、要不要换号
 - `status()` 只报「现在状态」（凭证 + 积分），冷却/禁用由核心叠加后给面板
 
-## 签到的坑（2026-08-31 实测，别踩）
+## 签到
 
 上游 `checkin_credits/*` **一律返回 HTTP 200**，成败只藏在 body 的 `code` 里：
 
@@ -52,21 +54,30 @@ src/
 |---|---|---|
 | `0` | 成功 | ok（**注意**：已签到后重复调用也返回 0，是幂等、不加积分） |
 | `9095` | 今日已签到 | already（幂等成功，不是失败） |
-| `9074` | 「当前参与用户太多」 | **等 8s 重试一次**——短时风控抖动，重试就过 |
+| `9074` | 「当前参与用户太多」 | **等 8s 重试一次**——上游短时抖动，重试就过 |
 
-所以**不能只看 HTTP 状态**（会误报成功），也**不能只看 `code 0`** 就以为签上了——
-claim 后要**回查 `checkin_credits/status` 的 `checked_in`** 才算数。
+据此定下的判定规则：
 
-几个实测证伪的结论（别照旧注释写回去）：
+- **不能只看 HTTP 状态**（一律 200，会误报成功）
+- **不能只看 `code 0` 就以为签上了** —— claim 后要**回查
+  `checkin_credits/status` 的 `checked_in`** 才算数
+- **不能拿积分当签到凭据** —— `ide_user_ent_usage` 是所有包的聚合剩余额度，
+  签到前后可能是同一个数
+- `checked_in` 是**当前登录态设备**的读数，换 deviceId 会短暂变 `false`，
+  那是缓存假象，不代表「这个账号今天还能再签一次」
+- 判重维度是**账号**不是设备：换 deviceId 后 `checked_in` 依然是 `true`
 
-- **9074 不是 deviceId 问题**：实测同一账号连发 25 次全成功；换全新的 deviceId
-  照样成功，再换回旧 id 也成功。它是上游抖动，不重试 = 当天签到直接废掉
-  （调度器一天只跑一次）。
-- **判重维度是账号，不是设备**：换新 deviceId 后 `checked_in` 依然是 `true`。
-- **积分不能当签到凭据**：`ide_user_ent_usage` 是所有包的聚合剩余额度，
-  实测某账号签到前后都是同一个数。
-- `checked_in` 只是**当前登录态设备**的读数，换 deviceId 会短暂变 `false`，
-  但那是缓存假象，不代表「这个账号今天还能再签一次」。
+调度器一天只跑一次，所以 9074 必须重试 —— 不重试等于当天签到直接废掉。
+
+## 致谢
+
+- [Sliverkiss/traework2api](https://github.com/Sliverkiss/traework2api) —— 本插件的
+  直接移植来源：上游客户端、登录流程、定时任务与常量表都来自它;
+- [rockswang/wild-work](https://github.com/rockswang/wild-work) —— 签到语义的参考:
+  `checkin_credits` 的业务码含义、以及「成败只看 body code、积分不能当凭据」
+  这些判定规则的来源;
+- [CARVIN94/dsh-router](https://github.com/CARVIN94/dsh-router) —— 宿主核心:
+  供应商契约、账号池策略与面板都来自它,本插件只是按契约实现一个供应商。
 
 ## License
 
