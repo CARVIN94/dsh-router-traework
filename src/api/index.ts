@@ -525,6 +525,8 @@ export class TraeworkSupplier implements Supplier {
         }
         let pendingUsage: Record<string, unknown> | null = null
         let sawDone = false
+        /** 已见（带名字）的 tool_call index：续帧（无 name）靠它放行。 */
+        const seenToolIdx = new Set<number>()
         const done = (): void => {
           ctrl.enqueue(enc.encode('data: [DONE]\n\n'))
           sawDone = true
@@ -540,7 +542,7 @@ export class TraeworkSupplier implements Supplier {
                 if (ev.response !== '') delta.content = ev.response
                 if (ev.reasoning !== '') delta.reasoning_content = ev.reasoning
                 if (ev.toolCalls !== null && ev.toolCalls !== 'null') {
-                  const tc = normalizeToolCalls(ev.toolCalls)
+                  const tc = normalizeToolCalls(ev.toolCalls, seenToolIdx)
                   if (tc.length > 0) delta.tool_calls = tc
                 }
                 if (Object.keys(delta).length > 0) chunk(delta, '', null)
@@ -619,7 +621,7 @@ function scanLine(st: { event: string; data: string }, line: string): {
   return undefined
 }
 
-function normalizeToolCalls(raw: unknown): unknown[] {
+function normalizeToolCalls(raw: unknown, seen: Set<number>): unknown[] {
   let arr: unknown[]
   if (Array.isArray(raw)) {
     arr = raw
@@ -641,16 +643,23 @@ function normalizeToolCalls(raw: unknown): unknown[] {
       delete call.function_call
     }
     const fn = call.function as Record<string, unknown> | undefined
-    if (fn !== null && typeof fn === 'object') {
-      delete fn.namespace
-      delete fn.partial_arguments
+    if (fn === null || typeof fn !== 'object') continue // 无 function 对象 → 垃圾
+    const idx = typeof call.index === 'number' ? call.index : 0
+    const name = fn.name
+    if (typeof name === 'string' && name !== '') {
+      // 首帧（带名字）→ 记住 index，续帧靠它放行
+      seen.add(idx)
+    } else if (!seen.has(idx)) {
+      // 没名字且没见过这个 index → 垃圾首帧，丢掉。不能一律丢「没名字」的帧：
+      // SOLO 把工具参数**分帧下发**，续帧只有 arguments、没有 name（非流式聚合
+      // 路径 mergeToolCallDelta 逐帧拼接 arguments 就是证据）——丢续帧 = 参数残缺，
+      // 下游在 [DONE] 判 EMPTY_RESPONSE。
+      continue
     }
-    // **没有名字的工具调用一律丢掉**：上游偶发漏发/形状不规整时会吐出
-    // 无 function 或 name 为空的 tool call，原样转发下去只能失败——下游报
-    // `unknown tool ""`，白白浪费一轮还看不出原因。丢掉比转发垃圾好：
-    // 客户端看到的是「模型没调工具」，而不是一个指向空名字的报错。
-    const name = (call.function as Record<string, unknown> | undefined)?.name
-    if (typeof name !== 'string' || name === '') continue
+    // 续帧（index 已见）放行：name 缺省下游沿用首帧；显式空名由 dsh-router
+    // 核心 fixFrame 剥掉，不会覆盖首帧名字。
+    delete fn.namespace
+    delete fn.partial_arguments
     out.push(call)
   }
   return out
