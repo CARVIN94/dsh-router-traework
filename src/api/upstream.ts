@@ -18,12 +18,28 @@ export type ErrKind =
   | 'not_found' // 404 → 短冷却 60s 不累计 errCount
   | 'server' // 5xx
   | 'client' // 其他 4xx
+  | 'checkin_denied' // 签到专属：上游拒绝发放（9074），与限流无关
 
 /** 签到业务码：今日已签到（幂等，按成功处理）。 */
 const CHECKIN_ALREADY_CODE = 9095
 
-/** 签到业务码：「当前参与用户太多」——短时风控抖动，等一下重试即可。 */
+/**
+ * 签到业务码：「当前参与用户太多」。
+ *
+ * **不是短时抖动，是账号级稳定拒绝**（2026-09-02 实测订正，旧注释写错了）：
+ * 两个账号连续 2 天、40 余次请求全部 9074；刷新 token、换 deviceId、
+ * 改 UA/region/body 均无变化。决定性对照：把失败账号的 deviceId 借给成功
+ * 账号 → 成功账号照样 code 0；把成功账号的 deviceId 借给失败账号 → 失败
+ * 账号仍 9074。**失败跟着账号走，不跟着设备走**。
+ *
+ * 所以它跟 chat 的 429 限流不是一回事，不该复用 'soft_rate'。
+ * 重试策略见 checkinClaim——保留一次快速重试只为兜住「万一上游哪天恢复成
+ * 真抖动」，成本压到最低。
+ */
 const CHECKIN_BUSY_CODE = 9074
+
+/** 9074 重试等待：只等 1s。一次落空就判失败，不再空耗（实测重试几乎必空）。 */
+const CHECKIN_BUSY_RETRY_MS = 1000
 
 export class UpstreamError extends Error {
   kind: ErrKind
@@ -452,7 +468,7 @@ export interface SoloClientOptions {
   timeoutSeconds?: number
   /** fetch 实现（默认全局 fetch；测试注入）。 */
   fetchImpl?: typeof fetch
-  /** 签到遇 9074 后的重试等待；生产默认 8s，测试注入 0 免等待。 */
+  /** 签到遇 9074 后的重试等待；生产默认 1s，测试注入 0 免等待。 */
   checkinRetryDelayMs?: number
   /** 可注入的 sleep（测试免等待）。 */
   sleep?: (ms: number) => Promise<void>
@@ -474,7 +490,7 @@ export class SoloClient {
     this.oauthHost = opts.oauthHost ?? SOLO.OAuthHost
     this.timeoutSeconds = opts.timeoutSeconds ?? 120
     this.fetchImpl = opts.fetchImpl ?? globalThis.fetch.bind(globalThis)
-    this.checkinRetryDelayMs = opts.checkinRetryDelayMs ?? 8000
+    this.checkinRetryDelayMs = opts.checkinRetryDelayMs ?? CHECKIN_BUSY_RETRY_MS
     this.sleepImpl = opts.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)))
   }
 
@@ -598,7 +614,8 @@ export class SoloClient {
     const data = await this.doJSON(this.ugHost + SOLO.EpCheckinStatus, ugHeaders(a), {})
     const r = data as { checked_in?: boolean; credits?: number; enable?: boolean; code?: number; message?: string; msg?: string }
     const code = Number(r.code ?? 0)
-    if (code !== 0) throw new UpstreamError('soft_rate', 200, `${r.message ?? r.msg ?? 'checkin status failed'} (code=${code})`)
+    // 1001 = 认证失败（实测：无效 token → code 1001 + enable false）
+    if (code !== 0) throw new UpstreamError(code === 1001 ? 'session_dead' : 'soft_rate', 200, `${r.message ?? r.msg ?? 'checkin status failed'} (code=${code})`)
     return { checkedIn: !!r.checked_in, credits: Number(r.credits ?? 0), enable: !!r.enable }
   }
 
@@ -608,11 +625,12 @@ export class SoloClient {
    *  业务码（2026-08-31 实测）：
    *  - 0    = 成功
    *  - 9095 = 今日已签到 → 幂等成功（不是失败）
-   *  - 9074 = 「参与用户太多」→ **短时风控抖动，重试即可过**（默认等 8s 重试一次）。
-   *           实测：同一账号连发 25 次全成功，换成新 deviceId 也照样成功、再换回旧 id
-   *           同样成功——所以 9074 既不是 deviceId 格式问题也不是频率问题，
-   *           不重试就等于当天签到直接废掉（调度器一天只跑一次）。
+   *  - 9074 = 「参与用户太多」→ **账号级稳定拒绝，不是抖动**（2026-09-02 订正，
+   *           见 CHECKIN_BUSY_CODE 注释：40 余次重试全失败、换 deviceId/token 无效）。
+   *           保留一次快速重试（默认 1s）只兜「上游万一恢复成真抖动」，落空即判失败，
+   *           不空耗 8s。
    *  - 9090 = 活动暂不可用（另一套 activity/action 体系，本插件不走）
+   *  - 1001 = token/会话失效（与 chat 的 401 同义）→ session_dead
    *
    *  判重维度是**账号**不是设备（实测：换新 deviceId 后 checked_in 仍为 true），
    *  所以「已签到」是幂等成功。deviceId 依然要稳定——它参与上游风控画像，
@@ -629,7 +647,9 @@ export class SoloClient {
         await this.sleepImpl(this.checkinRetryDelayMs)
         continue
       }
-      throw new UpstreamError('soft_rate', 200, msg)
+      // 9074 是签到专属拒绝，与 chat 限流无关——报独立分类，不污染限流计数
+      const kind = code === CHECKIN_BUSY_CODE ? 'checkin_denied' : code === 1001 ? 'session_dead' : 'soft_rate'
+      throw new UpstreamError(kind, 200, msg)
     }
   }
 

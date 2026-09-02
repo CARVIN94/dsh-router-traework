@@ -1,6 +1,8 @@
 /**
  * 定时任务：每日签到 + token 预刷新。移植自 traework2api/internal/scheduler/scheduler.go。
  * 签到成功后重新查积分，积分 > 0 的冷却账号自动解冻。
+ * 9074 是账号级稳定拒绝（见 upstream.ts CHECKIN_BUSY_CODE 注释），claim 只快速重试
+ * 一次（1s）兜抖动，落空即失败——不空耗 8s。
  */
 import type { SoloClient } from './upstream.ts'
 import type { Pool } from './pool.ts'
