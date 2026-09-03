@@ -12,6 +12,22 @@ export function randomId(): string {
   return randomBytes(16).toString('hex')
 }
 
+/**
+ * 生成 X-Market-User-Id 用的 uuid-v4。
+ *
+ * 这个 id **服务端不提供**：抓包翻遍 315 条流的响应体都没有它，auth.ts 也注明
+ * 是「TRAE 客户端本地为该账号分配的标识」。所以它只能由本插件在登录时生成，
+ * 并随凭证**持久化**——每次请求现生成会破坏指纹稳定性（真实客户端对同一账号
+ * 始终发同一个值，请求头突变的账号更容易被风控盯上）。
+ */
+export function newMarketUserId(): string {
+  const b = randomBytes(16)
+  b[6] = ((b[6] ?? 0) & 0x0f) | 0x40
+  b[8] = ((b[8] ?? 0) & 0x3f) | 0x80
+  const h = Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('')
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`
+}
+
 /** 构造登录 URL（带新 machine/device id）。 */
 export function buildLoginUrl(machineId: string, deviceId: string): string {
   const params = new URLSearchParams({

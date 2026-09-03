@@ -24,7 +24,7 @@ import {
   SoloStreamError,
 } from './upstream.ts'
 import { Scheduler } from './scheduler.ts'
-import { buildLoginUrl, parseLoginCallback, randomId } from './login.ts'
+import { buildLoginUrl, newMarketUserId, parseLoginCallback, randomId } from './login.ts'
 import type { Supplier, ModelInfo, ModelWithEnabled, ChatRequest } from '../types.ts'
 import type { AccountState, ChatOnceResult, SupplierStatusNow } from '../contract.ts'
 
@@ -137,7 +137,15 @@ export class TraeworkSupplier implements Supplier {
       try {
         const doc = this.credentials.get<unknown>(this.id, uid)
         if (doc === undefined) continue
-        out.push({ ...parseAuth(JSON.stringify(doc)), filePath: '' })
+        const a: Auth = { ...parseAuth(JSON.stringify(doc)), filePath: '' }
+        // 老凭证补 marketUserId：该字段是后加的（服务端不提供，只能本地生成），
+        // 存量账号没有它 → ugHeaders 不发 X-Market-User-Id，指纹比新登录的
+        // 账号少一头。补一次并落盘，之后每次启动都是同一个稳定值。
+        if (a.marketUserId === undefined || a.marketUserId === '') {
+          a.marketUserId = newMarketUserId()
+          this.saveAuth(a)
+        }
+        out.push(a)
       } catch {
         // 坏凭证静默跳过
       }
@@ -364,6 +372,8 @@ export class TraeworkSupplier implements Supplier {
       apiHost: this.cfg.oauthHost ?? SOLO.OAuthHost,
       machineId: pending?.machineId ?? '',
       deviceId: pending?.deviceId ?? '',
+      // 服务端不提供 marketUserId（抓包实证），只能本地生成并持久化
+      marketUserId: newMarketUserId(),
       filePath: '',
     }
     await this.client.refreshToken(auth) // ExchangeToken → accessToken + 新 refresh
