@@ -574,8 +574,7 @@ export class TraeworkSupplier implements Supplier {
                 // 天花板：此时响应头通常已写出（HTTP 语义绑死），无法换号
                 // 重试，只能把错误如实暴露。要能回退得在写头前缓冲（核心
                 // 侧改动，代价首字节延迟，见 dsh-router writeChatResult 注）。
-                onErr?.(new SoloStreamError(ev.errorCode, ev.errorMessage))
-                ctrl.enqueue(enc.encode(`event: error\ndata: ${JSON.stringify(`solo error code=${ev.errorCode} msg=${ev.errorMessage}`)}\n\n`))
+                chunk({ content: `upstream error code=${ev.errorCode}${ev.errorMessage !== '' ? `: ${ev.errorMessage}` : ''}` }, 'UPSTREAM_ERROR', pendingUsage)
                 done()
                 break
               }

@@ -148,3 +148,78 @@ test('多个 tool_call 并行分帧：各自按 index 拼接', async () => {
   ])
   assert.deepEqual(joinByIndex(args), ['{"command": "ls"}', '{"path": "/tmp"}'])
 })
+
+// ---------------------------------------------------------------------------
+// 上游流内错误（event: error）→ OpenAI 帧
+// ---------------------------------------------------------------------------
+
+/** 跑一次流式 chatOnce（上游返回指定 SSE 文本），返回全部 OpenAI 帧对象。 */
+async function streamFrames(sseText: string): Promise<Array<Record<string, any>>> {
+  const creds = fakeCreds()
+  creds.save('traework', 'u1', {
+    auth: { accessToken: 'at', refreshToken: 'rt', expiresAt: Math.floor(Date.now() / 1000) + 48 * 3600, domain: 'trae.cn', apiHost: '', machineId: 'm', deviceId: 'd' },
+    account: { uid: 'u1', enterpriseId: '', nickname: 'u1' },
+  })
+  const enc = new TextEncoder()
+  const origFetch = globalThis.fetch
+  globalThis.fetch = (async () =>
+    new Response(new ReadableStream<Uint8Array>({
+      start(ctrl) { ctrl.enqueue(enc.encode(sseText)); ctrl.close() },
+    }), { status: 200 })) as typeof fetch
+  const sup = new TraeworkSupplier({ stateFile: '' }, fakeStore(), creds, () => {})
+  await sup.start()
+  try {
+    const r = await sup.chatOnce('u1', {
+      model: 'glm-5.2',
+      stream: true,
+      rawBody: JSON.stringify({ model: 'glm-5.2', messages: [{ role: 'user', content: 'hi' }], stream: true }),
+    })
+    assert.equal(r.ok, true, JSON.stringify(r))
+    if (!('stream' in r)) throw new Error('expected stream')
+    const reader = r.stream.getReader()
+    const dec = new TextDecoder()
+    let text = ''
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      text += dec.decode(value, { stream: true })
+    }
+    const frames: Array<Record<string, any>> = []
+    for (const line of text.split('\n')) {
+      if (!line.startsWith('data: ')) continue
+      const payload = line.slice(6).trim()
+      if (payload === '' || payload === '[DONE]') continue
+      // 关键断言：每一帧都必须是可解析的 OpenAI 对象。
+      // 旧的 `event: error` + 裸字符串帧在这里解析不出 choices → 下游读不到
+      // 错误信息、且 [DONE] 时判 EMPTY_RESPONSE（在可重试白名单里）→ 对
+      // 4001 这类永久失败白重试 5 次。
+      frames.push(JSON.parse(payload) as Record<string, any>)
+    }
+    return frames
+  } finally {
+    sup.dispose()
+    globalThis.fetch = origFetch
+  }
+}
+
+test('流内 error：转成合规 OpenAI 帧（含错误文本 + 非白名单 finish_reason）', async () => {
+  const frames = await streamFrames(
+    'event: error\ndata: {"code":4001,"message":"We\'re sorry, the param is invalid."}\n\n' +
+    'event: done\ndata: {"finish_reason":"stop"}\n\n',
+  )
+  const errFrame = frames.find((f) => f.choices?.[0]?.finish_reason !== undefined && f.choices?.[0]?.finish_reason !== 'stop')
+  assert.ok(errFrame !== undefined, `未产出错误帧：${JSON.stringify(frames)}`)
+  // finish_reason 必须不在 dsh-llm 的可重试白名单，否则会被白重试 5 次
+  assert.equal(errFrame!.choices[0].finish_reason, 'UPSTREAM_ERROR')
+  // 错误原因必须可见（旧实现把信息丢在解析不出的裸字符串里）
+  const content = String(errFrame!.choices[0].delta?.content ?? '')
+  assert.match(content, /4001/, `错误码应出现在 content 里：${content}`)
+})
+
+test('流内 error 后必须收尾 [DONE]，且不再发 stop 终止帧', async () => {
+  const frames = await streamFrames('event: error\ndata: {"code":4023,"message":"model unavailable"}\n\n')
+  // 只有一个终止帧（error 那个），不应再补一个 finish_reason=stop
+  const finishes = frames.filter((f) => f.choices?.[0]?.finish_reason !== undefined)
+  assert.equal(finishes.length, 1, `终止帧应只有 1 个：${JSON.stringify(frames)}`)
+  assert.equal(finishes[0]?.choices[0].finish_reason, 'UPSTREAM_ERROR')
+})
