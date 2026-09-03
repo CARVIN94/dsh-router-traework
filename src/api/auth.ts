@@ -21,6 +21,13 @@ export interface Auth {
   nickname: string
   /** 落盘路径；refresh 后原子写回。 */
   filePath: string
+  /**
+   * X-Market-User-Id 所需的市场用户 UUID（如 8-4-4-4-12 形 6a22cc18-...）。
+   * 服务端 API（GetUserInfo 等）只返回数字 UserID，该 UUID 是 TRAE 客户端
+   * 本地为该账号分配的标识，插件无法从服务器取得——需登录时由客户端提供、
+   * 随凭证落盘持久化。
+   */
+  marketUserId?: string
 }
 
 /** 解析错误：missing accessToken 是硬错误，其余为格式错误。 */
@@ -61,6 +68,7 @@ function parseNested(raw: unknown): Omit<Auth, 'filePath'> {
     uid: String(account.uid ?? ''),
     enterpriseId: String(account.enterpriseId ?? ''),
     nickname: String(account.nickname ?? ''),
+    marketUserId: String(auth.marketUserId ?? '') || undefined,
   }
 }
 
@@ -79,6 +87,7 @@ function parseFlat(raw: unknown): Omit<Auth, 'filePath'> {
     uid: String(f.uid ?? ''),
     enterpriseId: String(f.enterpriseId ?? ''),
     nickname: String(f.nickname ?? ''),
+    marketUserId: String(f.marketUserId ?? '') || undefined,
   }
 }
 
@@ -110,6 +119,7 @@ export function toAuthDoc(a: Auth): Record<string, unknown> {
       apiHost: a.apiHost,
       machineId: a.machineId,
       deviceId: a.deviceId,
+      marketUserId: a.marketUserId,
     },
     account: {
       uid: a.uid,

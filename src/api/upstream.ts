@@ -5,6 +5,7 @@
  */
 import { SOLO, CLIENT_UA } from './constants.ts'
 import { needsRefresh, type Auth } from './auth.ts'
+import { randomBytes } from 'node:crypto'
 
 // ---------------------------------------------------------------------------
 // 错误分类（SPEC §4.3）
@@ -41,6 +42,11 @@ const CHECKIN_BUSY_CODE = 9074
 /** 9074 重试等待：只等 1s。一次落空就判失败，不再空耗（实测重试几乎必空）。 */
 const CHECKIN_BUSY_RETRY_MS = 1000
 
+/**
+ * 上游「自定义模型」config_name 前缀：这类是用户在 TRAE 云端挂的第三方
+ * 代理（base_url 指向别处），不属于本供应商配额，发过去就在流里报 4023。
+ * 上游的 is_custom_model 标志不可靠（实测全为 false），只能靠前缀兜底。
+ */
 export class UpstreamError extends Error {
   kind: ErrKind
   status: number
@@ -103,16 +109,52 @@ export function soloHeaders(a: Auth, stream: boolean): Record<string, string> {
   return h
 }
 
-/** UgHeaders：签到/积分（api.trae.cn）所需头。 */
+/** 生成 uuid-v4 形标识（8-4-4-4-12）。 */
+function genUuid(): string {
+  const b = randomBytes(16)
+  b[6] = (b[6] ?? 0) & 0x0f | 0x40
+  b[8] = (b[8] ?? 0) & 0x3f | 0x80
+  const h = Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('')
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`
+}
+
+/** 生成 tt-trace-id（格式 00-32hex-16hex-01，与真实客户端一致）。 */
+function genTTTraceId(requestId: string): string {
+  const trace = randomBytes(16).toString('hex')
+  const span = requestId.replace(/-/g, '').slice(0, 16)
+  return `00-${trace}-${span}-01`
+}
+
+/**
+ * UgHeaders：签到/积分（api.trae.cn）所需头。
+ * 与真实 TRAE 客户端逐头对齐（2026-09-03 抓包实测成功账号的请求头）。
+ * 伪装身份：Windows + Trae{version}（与 soloHeaders 自洽，避免设备信息矛盾）。
+ */
 export function ugHeaders(a: Auth): Record<string, string> {
+  const requestId = genUuid()
   const h: Record<string, string> = {
     'Content-Type': 'application/json',
     Accept: 'application/json',
     'User-Agent': CLIENT_UA,
     Authorization: `Cloud-IDE-JWT ${a.accessToken}`,
     'X-User-Region': 'CN',
+    'Accept-Language': 'zh-CN',
+    'Package-Type': 'stable_cn',
+    'X-Lgw-Req-Sdk-Type': '3',
+    'X-Market-Client-Id': CLIENT_UA,
+    'X-Device-Brand': SOLO.DeviceBrand,
+    'X-Device-Type': 'windows',
+    'X-OS-Version': SOLO.OSVersion,
+    'App-Version': SOLO.IdeVersion,
+    'X-Request-Id': requestId,
+    'X-TT-Trace-Id': genTTTraceId(requestId),
+    'Sec-Fetch-Dest': 'empty',
+    'Sec-Fetch-Mode': 'cors',
+    'Sec-Fetch-Site': 'none',
   }
   if (a.deviceId !== '') h['X-Device-Id'] = a.deviceId
+  if (a.uid !== '') h['X-Uid'] = a.uid
+  if (a.marketUserId) h['X-Market-User-Id'] = a.marketUserId
   return h
 }
 
@@ -351,7 +393,15 @@ function mergeToolCallDelta(merged: Record<string, unknown>, delta: Record<strin
   if (typeof delta.type === 'string' && delta.type !== '') merged.type = delta.type
   let df = delta.function as Record<string, unknown> | undefined
   if (df === null || typeof df !== 'object') df = delta.function_call as Record<string, unknown> | undefined
-  if (df === null || typeof df !== 'object') return
+  // 顶层 name/arguments/params/input/tool_name 形态（与流式 normalizeToolCalls 同源）
+  if (df === null || typeof df !== 'object') {
+    const topName = delta.name ?? delta.tool_name
+    const topArgs = delta.arguments ?? delta.params ?? delta.input
+    if (typeof topName !== 'string' && topArgs === undefined) return
+    df = {}
+    if (typeof topName === 'string' && topName !== '') df.name = topName
+    if (topArgs !== undefined) df.arguments = topArgs
+  }
   delete df.namespace
   delete df.partial_arguments
   let mf = merged.function as Record<string, unknown> | undefined
@@ -601,6 +651,10 @@ export class SoloClient {
     for (const cfg of list) {
       const c = cfg as { config_name?: string; display_config?: { display_name?: string; is_custom_model?: boolean } }
       if (!c.config_name) continue
+      // 过滤用户/其他工具在 TRAE 云端添加的自定义模型（base_url 指向别处，不属于本供应商）。
+      // 前缀兜底**不能省**：2026-09-03 实测上游对 11 个 custom_model_* 全部返回
+      // is_custom_model=false，只认这个标志等于没过滤——面板会混进一批发过去
+      // 就在流里报 4023 的模型（与 wild-work 的做法一致）。
       // 过滤用户/其他工具在 TRAE 云端添加的自定义模型（base_url 指向别处，不属于本供应商）
       if (c.display_config?.is_custom_model === true) continue
       out.push({ id: c.config_name, name: c.display_config?.display_name ?? '', contextWindow: 0, maxTokens: 0 })
