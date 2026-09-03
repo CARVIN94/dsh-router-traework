@@ -10,8 +10,14 @@ export const SOLO = {
   ConsoleHost: 'https://www.trae.cn',
   ClientID: 'en1oxy7wnw8j9n', // SOLO stable
   AppID: '6eefa01c-1036-4c7e-9ca5-d891f63bfcd8',
-  IdeVersion: '0.1.43',
-  IdeVersionCode: '20260716',
+  // 版本码**决定上游返回哪张模型配置表**，比 IdeVersion 更关键（2026-09-03
+  // 实测）：X-Ide-Version 用 0.1.43 还是 0.1.61 都不影响结果，
+  // 但 version-code=20260716 → 35 个模型、无 glm-5.3；20260820 → 36 个、含
+  // glm-5.3。更糟的是拿 20260716 直接调 glm-5.3：上游 HTTP 200 但流里回
+  // `event:error code=4001`（参数无效）——列表和实际可用性是同一张表。
+  // 真实客户端 0.1.61 发的就是 20260820（抓包实证）。
+  IdeVersion: '0.1.61',
+  IdeVersionCode: '20260820',
   DeviceBrand: '83DG',
   OSVersion: 'Windows 11 Pro',
   Function: 'solo_work_lite',
