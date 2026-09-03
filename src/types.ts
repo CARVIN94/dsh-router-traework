@@ -38,7 +38,6 @@ export interface Supplier {
   status(): SupplierStatusNow
   listModels(force?: boolean): Promise<ModelInfo[]> | ModelInfo[]
   modelsWithEnabled(): Promise<ModelWithEnabled[]> | ModelWithEnabled[]
-  getAlias(): string
   customModelIds?(): string[]
   chatOnce(uid: string, req: ChatRequest): Promise<ChatOnceResult>
   removeLink?(uid: string): Promise<boolean>

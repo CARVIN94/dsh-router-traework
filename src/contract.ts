@@ -113,19 +113,18 @@ export interface SupplierModule {
   /** 报账号「现在状态」（插件只报它观察到的）。冷却/禁用/错误累计由核心叠加。 */
   status(): SupplierStatusNow
   listModels(force?: boolean): Promise<ModelInfo[]> | ModelInfo[]
-  getAlias(): string
   /**
    * 对**单个账号**调一次上游。插件不遍历账号、不管冷却、不写 res——
    * 选号/回退/健康判定全是核心的活。
+   *
+   * 失败原因通过返回值的 `message` 报（核心测试模型时直接拿它做诊断提示），
+   * 插件不必维护「上次失败」的状态。
    */
   chatOnce(uid: string, req: ChatRequest): Promise<ChatOnceResult>
   dispose(): void
 
   // ---- 差异化能力（可选） ----
 
-  /** 上次 chatOnce 失败原因（诊断用）。测试模型由 dsh-router 核心统一走
-   *  chatOnce 路径（账号池回退/冷却自动生效），插件只需暴露失败原因。 */
-  lastError?(): string | undefined
   generateLoginUrl?(): string | { ok: boolean; error?: string; loginUrl?: string }
   completeLogin?(callbackUrl: string): Promise<{ uid: string; nickname: string }>
   /** 单个链接签到。遍历所有链接 + 结果汇总是 dsh-router 核心的活。

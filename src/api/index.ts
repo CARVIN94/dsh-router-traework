@@ -97,7 +97,6 @@ export class TraeworkSupplier implements Supplier {
   private log: (msg: string) => void
   private modelsCache: ModelInfo[] | undefined
   /** 上次 chatOnce 失败原因（供核心测试模型汇总诊断）。 */
-  private lastErrText: string | undefined
   private pendingLogin: { machineId: string; deviceId: string } | undefined
 
   constructor(cfg: Partial<TraewConfig>, store: SupplierConfigStoreLike, credentials: CredentialStoreLike, log?: (msg: string) => void) {
@@ -261,11 +260,6 @@ export class TraeworkSupplier implements Supplier {
     }
   }
 
-  /** 供应商前缀（模型全名 = alias/id）。别名留空即用供应商 id（默认值）。 */
-  getAlias(): string {
-    return this.store.get(this.id).alias || this.id
-  }
-
   /** 用户手动添加的模型 id（supplier-config custom）。 */
   customModelIds(): string[] {
     return [...this.store.get(this.id).custom]
@@ -352,12 +346,6 @@ export class TraeworkSupplier implements Supplier {
     this.store.setAllModelsEnabled(this.id, enabled, this.allModels().map((m) => m.id))
   }
 
-  /** 上次 chatCompletions 失败原因（诊断用）。测试模型由 dsh-router 核心统一走
-   *  chatCompletions 路径（账号池回退/冷却自动生效），插件只需暴露失败原因。 */
-  lastError(): string | undefined {
-    return this.lastErrText
-  }
-
   // -------------------------------------------------------------------------
   // 登录（加账号）：生成登录链接 → 粘贴回调 → 换 token 落盘
   // -------------------------------------------------------------------------
@@ -433,12 +421,12 @@ export class TraeworkSupplier implements Supplier {
     const configName = mapModel(req.model, this.allKnownIds(), this.cfg.defaultModel)
     if (configName === undefined) {
       // 不是本供应商的模型：交给下一个供应商
-      this.lastErrText = `unknown model ${JSON.stringify(req.model)}`
-      return { ok: false, state: 'no_such_model', message: this.lastErrText }
+      const msg = `unknown model ${JSON.stringify(req.model)}`
+      return { ok: false, state: 'no_such_model', message: msg }
     }
     if (this.store.get(this.id).disabled.includes(configName)) {
-      this.lastErrText = `model ${JSON.stringify(configName)} is disabled`
-      return { ok: false, state: 'no_such_model', message: this.lastErrText }
+      const msg = `model ${JSON.stringify(configName)} is disabled`
+      return { ok: false, state: 'no_such_model', message: msg }
     }
 
     let body = req.rawBody
@@ -452,8 +440,8 @@ export class TraeworkSupplier implements Supplier {
 
     const acct = this.pool.authByUID(uid)
     if (acct === undefined) {
-      this.lastErrText = `unknown account ${JSON.stringify(uid)}`
-      return { ok: false, state: 'no_such_model', message: this.lastErrText }
+      const msg = `unknown account ${JSON.stringify(uid)}`
+      return { ok: false, state: 'no_such_model', message: msg }
     }
 
     // token 临近过期 → 先 refresh（过期=这个号现在不可用，核心会按 session_dead 处理）
@@ -461,27 +449,26 @@ export class TraeworkSupplier implements Supplier {
       const refreshed = await this.client.refreshTokenIfNeeded(acct, this.cfg.refreshSkewMs)
       if (refreshed) this.saveAuth(acct)
     } catch (err) {
-      this.lastErrText = `refresh: ${(err as Error).message}`
       const ue = err as { kind?: string }
-      return { ok: false, state: ue.kind === 'session_dead' ? 'session_dead' : 'transport', message: this.lastErrText }
+      return { ok: false, state: ue.kind === 'session_dead' ? 'session_dead' : 'transport', message: `refresh: ${(err as Error).message}` }
     }
 
     let streamRes: { body: ReadableStream<Uint8Array> | null; status: number; respBody: string }
     try {
       streamRes = await this.client.chatStream(acct, body)
     } catch (err) {
-      this.lastErrText = (err as Error).message
-      return { ok: false, state: 'transport', message: this.lastErrText }
+      const msg = (err as Error).message
+      return { ok: false, state: 'transport', message: msg }
     }
 
     if (streamRes.status >= 400) {
       const kind = classify(streamRes.status, streamRes.respBody)
-      this.lastErrText = new UpstreamError(kind, streamRes.status, streamRes.respBody).message
-      return { ok: false, state: this.stateOf(kind), message: this.lastErrText }
+      const msg = new UpstreamError(kind, streamRes.status, streamRes.respBody).message
+      return { ok: false, state: this.stateOf(kind), message: msg }
     }
     if (streamRes.body === null) {
-      this.lastErrText = 'traework upstream: empty stream body'
-      return { ok: false, state: 'transport', message: this.lastErrText }
+      const msg = 'traework upstream: empty stream body'
+      return { ok: false, state: 'transport', message: msg }
     }
 
     // 流式：SOLO SSE → OpenAI SSE 后交回核心写（响应头已写即绑死，见核心注释）
@@ -493,9 +480,8 @@ export class TraeworkSupplier implements Supplier {
     // 非流式：聚合后判空——空响应视为失败，让核心换号/换模型回退
     const { response, error } = await aggregate(linesFromStream(streamRes.body))
     if (error) {
-      this.lastErrText = error.message
       this.noteMidStream(uid, error)
-      return { ok: false, state: this.stateOf(error.kind()), message: this.lastErrText }
+      return { ok: false, state: this.stateOf(error.kind()), message: error.message }
     }
     const msg = (response as { choices?: Array<{ message?: Record<string, unknown> }> })?.choices?.[0]?.message
     const hasContent =
@@ -503,8 +489,8 @@ export class TraeworkSupplier implements Supplier {
       typeof msg?.reasoning_content === 'string' && msg.reasoning_content.length > 0 ||
       Array.isArray(msg?.tool_calls) && msg.tool_calls.length > 0
     if (!hasContent) {
-      this.lastErrText = 'upstream returned empty response'
-      return { ok: false, state: 'unknown', message: this.lastErrText }
+      const msg = 'upstream returned empty response'
+      return { ok: false, state: 'unknown', message: msg }
     }
     return { ok: true, status: 200, body: JSON.stringify(response) }
   }
