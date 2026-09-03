@@ -47,6 +47,14 @@ const CHECKIN_BUSY_RETRY_MS = 1000
  * 代理（base_url 指向别处），不属于本供应商配额，发过去就在流里报 4023。
  * 上游的 is_custom_model 标志不可靠（实测全为 false），只能靠前缀兜底。
  */
+const CUSTOM_MODEL_PREFIX = 'custom_model_'
+
+/**
+ * 实测不产出对话内容的内部模型（2026-09-03 逐个打真实上游验证）。
+ * 只加**确认不可用**的：这个表多留一个只是面板多一行，误删一个就是断模型。
+ */
+const NON_CHAT_MODELS = new Set(['browser_use_subagent'])
+
 export class UpstreamError extends Error {
   kind: ErrKind
   status: number
@@ -655,8 +663,18 @@ export class SoloClient {
       // 前缀兜底**不能省**：2026-09-03 实测上游对 11 个 custom_model_* 全部返回
       // is_custom_model=false，只认这个标志等于没过滤——面板会混进一批发过去
       // 就在流里报 4023 的模型（与 wild-work 的做法一致）。
-      // 过滤用户/其他工具在 TRAE 云端添加的自定义模型（base_url 指向别处，不属于本供应商）
       if (c.display_config?.is_custom_model === true) continue
+      if (c.config_name.startsWith(CUSTOM_MODEL_PREFIX)) continue
+      // 内部调度模型：不产出对话内容，发出去只能拿到空响应（2026-09-03 逐个
+      // 实测：browser_use_subagent 全程零 output 帧、completion_tokens=0）。
+      //
+      // **不能**用上游的 is_invisible_to_user 当过滤条件——实测它把 glm-5 /
+      // glm-5-turbo / seed-code-pro-0430 / Doubao-Seed-2.0-Code 也标成 true，
+      // 而这四个都能正常对话，照它过滤会静默砍掉 4 个可用模型。同理，
+      // file_search_agent / explore_sub_agent_v2 / summary 虽然看着像内部件，
+      // 实测都能正常出内容，一并保留。
+      // 所以这里只列**实测确认不可用**的，宁可多留一个也不误杀。
+      if (NON_CHAT_MODELS.has(c.config_name)) continue
       out.push({ id: c.config_name, name: c.display_config?.display_name ?? '', contextWindow: 0, maxTokens: 0 })
     }
     if (out.length === 0) throw new Error('models api returned empty list')
