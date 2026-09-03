@@ -48,6 +48,8 @@ dsh plugin --profile web add dsh-router-traework
 - 失败时返回语义状态（`rate_limit` / `quota` / `session_dead` / `unavailable` /
   `transport` / `unknown`），由核心决定冷却多久、是否禁用、要不要换号
 - `status()` 只报「现在状态」（凭证 + 积分），冷却/禁用由核心叠加后给面板
+- 积分只报**值**，不落盘（持久化归核心 `supplier-config.json`）：启动时用核心
+  缓存预热，拿不到时报 `-1`（不是 0），核心保留上次持久化的值
 
 完整契约见 [dsh-router 的 `docs/suppliers.md`](https://github.com/CARVIN94/dsh-router/blob/main/docs/suppliers.md)。
 

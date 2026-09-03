@@ -85,9 +85,10 @@ test('存量凭证缺失 marketUserId → 自动补齐并落盘（否则该头�
     remove: () => {},
   }
   const store = {
-    get: () => ({ alias: 'traework', disabled: [], custom: [], poolOrder: [], poolStrategy: 'fallback' as const }),
+    get: () => ({ alias: 'traework', disabled: [], custom: [], poolOrder: [], poolStrategy: 'fallback' as const, credits: {} }),
     setAlias: () => {}, setPoolOrder: () => {}, setPoolStrategy: () => {},
     setModelEnabled: () => {}, addCustomModel: () => {}, removeCustomModel: () => {}, setAllModelsEnabled: () => {},
+    getCredits: () => -1, putCredits: (_i: string, _u: string, reported: number) => reported, clearCredits: () => {},
   }
   const sup = new TraeworkSupplier({ stateFile: '' }, store, creds, () => {})
   await sup.start()
@@ -111,9 +112,10 @@ test('已有 marketUserId 的凭证 → 不重复改写', async () => {
     remove: () => {},
   }
   const store = {
-    get: () => ({ alias: 'traework', disabled: [], custom: [], poolOrder: [], poolStrategy: 'fallback' as const }),
+    get: () => ({ alias: 'traework', disabled: [], custom: [], poolOrder: [], poolStrategy: 'fallback' as const, credits: {} }),
     setAlias: () => {}, setPoolOrder: () => {}, setPoolStrategy: () => {},
     setModelEnabled: () => {}, addCustomModel: () => {}, removeCustomModel: () => {}, setAllModelsEnabled: () => {},
+    getCredits: () => -1, putCredits: (_i: string, _u: string, reported: number) => reported, clearCredits: () => {},
   }
   const sup = new TraeworkSupplier({ stateFile: '' }, store, creds, () => {})
   await sup.start()

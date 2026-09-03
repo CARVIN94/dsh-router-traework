@@ -82,10 +82,16 @@ export class TraeworkSupplier implements Supplier {
   private pool: Pool
   private client: SoloClient
   private scheduler: Scheduler
-  /** 积分拉取时间（uid → ms）：status() 同步返回池里的值，过期后台异步刷新。 */
+  /** 积分拉取时间（uid → ms）：status() 同步返回池里的值，过期后台异步刷新。
+   *  积分本身由核心持久化（supplier-config.json），这里只管内存 TTL。 */
   private creditsAt = new Map<string, number>()
   /** 积分缓存有效期。 */
   private static readonly CREDITS_TTL_MS = 10 * 60 * 1000
+  /**
+   * 拿不到积分时报它（**不是 0**）：核心靠这个区分「没拿到」和「拿到了 0」。
+   * 报 0 会把核心那边的缓存冲成 0。
+   */
+  private static readonly CREDITS_UNKNOWN = -1
   private store: SupplierConfigStoreLike
   private credentials: CredentialStoreLike
   private log: (msg: string) => void
@@ -126,8 +132,25 @@ export class TraeworkSupplier implements Supplier {
   async start(): Promise<void> {
     const auths = this.loadAuths()
     this.pool.syncToDir(auths)
+    // 积分现在由核心持久化（supplier-config.json），这里拿它预热内存：
+    // 异步拉完之前面板就有数，不必等第一次网络往返。
+    this.seedCreditsFromCoreCache()
     this.scheduler.start()
     this.refreshCredits()
+  }
+
+  /** 用核心缓存的积分预热（没有缓存的号保持 -1）。
+   *  顺带做一次迁移：旧 state.json 里存的积分交给核心，之后核心自己管。 */
+  private seedCreditsFromCoreCache(): void {
+    const cached = this.store.get(this.id).credits
+    const legacy = this.pool.takeLegacyCredits()
+    for (const st of this.pool.list()) {
+      const v = cached[st.uid] ?? legacy[st.uid]
+      if (typeof v === 'number' && v >= 0) {
+        this.pool.setCredits(st.uid, v)
+        this.creditsAt.set(st.uid, Date.now())
+      }
+    }
   }
 
   /** 从 dsh-router 凭证存储读取本供应商全部凭证。 */

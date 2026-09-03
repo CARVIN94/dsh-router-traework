@@ -6,7 +6,7 @@
  */
 import type { ChatRequest, ModelInfo } from './types.ts'
 
-/** 通用配置存储（dsh-router 核心注入；连接池/模型管理/别名）。 */
+/** 通用配置存储（dsh-router 核心注入；连接池/模型管理/别名/积分缓存）。 */
 export interface SupplierConfigStoreLike {
   get(id: string): {
     alias: string
@@ -14,6 +14,8 @@ export interface SupplierConfigStoreLike {
     custom: string[]
     poolOrder: string[]
     poolStrategy: 'fallback' | 'round-robin'
+    /** 积分缓存：uid → 剩余额度（-1 = 还没拿到过）。 */
+    credits: Record<string, number>
   }
   setAlias(id: string, alias: string): void
   setPoolOrder(id: string, uids: string[]): void
@@ -22,6 +24,12 @@ export interface SupplierConfigStoreLike {
   addCustomModel(id: string, modelId: string): void
   removeCustomModel(id: string, modelId: string): void
   setAllModelsEnabled(id: string, enabled: boolean, modelIds: string[]): void
+  /** 读积分缓存；没缓存过返回 -1。 */
+  getCredits(id: string, uid: string): number
+  /** 合并插件报的积分：-1（未知）回落到缓存值，非 -1 写入并返回它。 */
+  putCredits(id: string, uid: string, reported: number): number
+  /** 删链接时清掉它的积分缓存。 */
+  clearCredits(id: string, uid: string): void
 }
 
 /** 通用凭证存储（dsh-router 核心注入；不透明凭证 blob）。 */
@@ -54,6 +62,12 @@ export type AccountState =
 export interface SupplierAccountNow {
   uid: string
   nickname?: string
+  /**
+   * 剩余额度。**拿不到就报 `-1`**，不是 0：
+   * 插件刚重启（内存缓存空）、积分拉取失败、或压根不支持积分时都是 `-1`。
+   * 核心据此保留上一次持久化下来的值 —— 报 0 会把缓存冲成 0（0 是真值
+   * 「用完了」，核心分不清「拿到 0」和「没拿到」）。
+   */
   credits: number
   state: AccountState
   message?: string

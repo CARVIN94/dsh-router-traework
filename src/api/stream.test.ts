@@ -15,7 +15,7 @@ import type { SupplierConfigStoreLike, CredentialStoreLike } from '../contract.t
 
 function fakeStore(): SupplierConfigStoreLike {
   return {
-    get: () => ({ alias: 'traework', disabled: [], custom: ['glm-5.2'], poolOrder: [], poolStrategy: 'fallback' }),
+    get: () => ({ alias: 'traework', disabled: [], custom: ['glm-5.2'], poolOrder: [], poolStrategy: 'fallback', credits: {} }),
     setAlias: () => {},
     setPoolOrder: () => {},
     setPoolStrategy: () => {},
@@ -23,6 +23,9 @@ function fakeStore(): SupplierConfigStoreLike {
     addCustomModel: () => {},
     removeCustomModel: () => {},
     setAllModelsEnabled: () => {},
+    getCredits: () => -1,
+    putCredits: (_i: string, _u: string, reported: number) => reported,
+    clearCredits: () => {},
   }
 }
 
