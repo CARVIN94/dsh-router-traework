@@ -557,6 +557,24 @@ export class TraeworkSupplier implements Supplier {
                 break
               case 'error': {
                 onErr?.(new SoloStreamError(ev.errorCode, ev.errorMessage))
+                // 上游流内错误必须写成**合规的 OpenAI 帧**，不能只发
+                // `event: error` + 裸字符串：dsh-llm 的 translateSse 只解析
+                // `choices[].delta/finish_reason`，裸字符串帧解析不出 choices
+                // → 错误信息全丢，且 [DONE] 时因「无任何产出块」被判
+                // EMPTY_RESPONSE —— 而这个码在 dsh-llm 的可重试白名单里，
+                // 于是 agent-loop 会对**永久失败**（如 code 4001 参数无效、
+                // 4023 模型不可用）白重试 5 次，用户侧只看到「空响应」。
+                //
+                // 改法：先吐一帧带 content 的 delta（让错误原因可见），
+                // 再用 finish_reason='UPSTREAM_ERROR' 收尾。它不在白名单
+                // （EMPTY_RESPONSE/RATE_LIMIT/SERVER/TIMEOUT/TRANSPORT），
+                // 所以不会重试；mapFinishReason 的 default 分支会把它转成
+                // error finish，agent-loop 拿到的是真错误而不是空响应。
+                //
+                // 天花板：此时响应头通常已写出（HTTP 语义绑死），无法换号
+                // 重试，只能把错误如实暴露。要能回退得在写头前缓冲（核心
+                // 侧改动，代价首字节延迟，见 dsh-router writeChatResult 注）。
+                onErr?.(new SoloStreamError(ev.errorCode, ev.errorMessage))
                 ctrl.enqueue(enc.encode(`event: error\ndata: ${JSON.stringify(`solo error code=${ev.errorCode} msg=${ev.errorMessage}`)}\n\n`))
                 done()
                 break
@@ -638,14 +656,34 @@ function normalizeToolCalls(raw: unknown, seen: Set<number>): unknown[] {
   for (const item of arr) {
     const call = item as Record<string, unknown>
     if (typeof call !== 'object' || call === null) continue
+    // 兼容 function_call 别名（SOLO 分帧首帧形态）
     if (call.function_call !== null && typeof call.function_call === 'object') {
       call.function = call.function_call
       delete call.function_call
     }
+    // 真实上游还会用顶层 name/arguments/params/input/tool_name 形态（trae-solo-local-api
+    // 的 llmUtilsChunkToOpenAI 就是按这些字段取的）——不能只认 function/function_call，
+    // 否则顶层形态的续帧会被当垃圾丢掉，参数残缺 → 下游 [DONE] 判 EMPTY_RESPONSE。
+    const topName = call.name ?? call.tool_name
+    const topArgs = call.arguments ?? call.params ?? call.input
     const fn = call.function as Record<string, unknown> | undefined
-    if (fn === null || typeof fn !== 'object') continue // 无 function 对象 → 垃圾
+    if (fn === null || typeof fn !== 'object') {
+      if (typeof topName !== 'string' && topArgs === undefined) continue // 真垃圾
+      call.function = {}
+    }
+    const f = call.function as Record<string, unknown>
+    if (typeof topName === 'string' && topName !== '' && typeof f.name !== 'string') f.name = topName
+    if (topArgs !== undefined && f.arguments === undefined) f.arguments = topArgs
+    // partial_arguments 兜底：arguments 缺失时用它，别直接删掉
+    if (f.arguments === undefined && f.partial_arguments !== undefined) f.arguments = f.partial_arguments
+    delete f.namespace
+    delete f.partial_arguments
+    delete call.name
+    delete call.tool_name
+    delete call.params
+    delete call.input
     const idx = typeof call.index === 'number' ? call.index : 0
-    const name = fn.name
+    const name = f.name
     if (typeof name === 'string' && name !== '') {
       // 首帧（带名字）→ 记住 index，续帧靠它放行
       seen.add(idx)
@@ -658,8 +696,6 @@ function normalizeToolCalls(raw: unknown, seen: Set<number>): unknown[] {
     }
     // 续帧（index 已见）放行：name 缺省下游沿用首帧；显式空名由 dsh-router
     // 核心 fixFrame 剥掉，不会覆盖首帧名字。
-    delete fn.namespace
-    delete fn.partial_arguments
     out.push(call)
   }
   return out
