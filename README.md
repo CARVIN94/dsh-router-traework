@@ -58,12 +58,12 @@ dsh plugin --profile web add dsh-router-traework
 
 上游 `checkin_credits/*` **一律返回 HTTP 200**，成败只藏在 body 的 `code` 里：
 
-| code | 含义 | 处理 |
-|---|---|---|
-| `0` | 成功 | ok（**注意**：已签到后重复调用也返回 0，是幂等、不加积分） |
-| `9095` | 今日已签到 | already（幂等成功，不是失败） |
-| `9074` | 「当前参与用户太多」 | **账号级稳定拒绝**，不是抖动——只重试一次（等 1s）就判失败 |
-| `1001` | token/会话失效 | session_dead（与 chat 401 同义） |
+| code   | 含义                 | 处理                                                       |
+| ------ | -------------------- | ---------------------------------------------------------- |
+| `0`    | 成功                 | ok（**注意**：已签到后重复调用也返回 0，是幂等、不加积分） |
+| `9095` | 今日已签到           | already（幂等成功，不是失败）                              |
+| `9074` | 「当前参与用户太多」 | **账号级稳定拒绝**，不是抖动——只重试一次（等 1s）就判失败  |
+| `1001` | token/会话失效       | session_dead（与 chat 401 同义）                           |
 
 据此定下的判定规则：
 
@@ -80,6 +80,7 @@ dsh plugin --profile web add dsh-router-traework
 ### 剩余积分的计算
 
 `ide_user_ent_usage` 返回 `user_entitlement_pack_list`，剩余 = Σ(`credits_limit`
+
 - `credits_amount`)。实测要点：
 
 - **请求体必须是 `{"require_usage":true,"req_source":2}`**，发 `{}` 拿不到完整 usage
@@ -132,7 +133,9 @@ pnpm test         # node --test "src/**/*.test.ts"
   直接移植来源：上游客户端、登录流程、定时任务与常量表都来自它;
 - [rockswang/wild-work](https://github.com/rockswang/wild-work) —— 签到语义的参考:
   `checkin_credits` 的业务码含义、以及「成败只看 body code、积分不能当凭据」
-  这些判定规则的来源。
+  这些判定规则的来源;
+- [star620/TRAE-Automatic-sign-in](https://github.com/star620/TRAE-Automatic-sign-in) ——
+  TRAE 每日自动签到助手的参考。
 
 ## 许可证
 
