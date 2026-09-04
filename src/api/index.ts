@@ -417,7 +417,7 @@ export class TraeworkSupplier implements Supplier {
    * 对**单个账号**调一次上游。选号/冷却/禁用/换号是核心的活（AccountPool），
    * 这里只负责：token 刷新 + 上游协议调用/转换，并报告结果。
    */
-  async chatOnce(uid: string, req: ChatRequest): Promise<ChatOnceResult> {
+  async chatOnce(uid: string, lv: string, req: ChatRequest): Promise<ChatOnceResult> {
     const configName = mapModel(req.model, this.allKnownIds(), this.cfg.defaultModel)
     if (configName === undefined) {
       // 不是本供应商的模型：交给下一个供应商
@@ -433,6 +433,12 @@ export class TraeworkSupplier implements Supplier {
     try {
       const obj = JSON.parse(body) as Record<string, unknown>
       obj.model = configName
+      // 推理等级：上游自己的协议里若认 reasoning_effort 就带上；auto/off 不显式下发
+      if (lv !== 'auto' && lv !== '' && lv !== 'none' && lv !== 'off') obj.reasoning_effort = lv
+      else if (lv === 'none' || lv === 'off') {
+        delete obj.reasoning_effort
+        delete obj.reasoning_summary
+      }
       body = JSON.stringify(obj)
     } catch {
       // 保持原样

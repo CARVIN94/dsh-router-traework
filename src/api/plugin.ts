@@ -37,7 +37,7 @@ export default function factory(env: SupplierEnv): SupplierModule & { removeLink
     icon,
     status: (): SupplierStatusNow => instance!.status(),
     listModels: (force?: boolean): ModelInfo[] | Promise<ModelInfo[]> => instance!.listModels(force),
-    chatOnce: (uid: string, req: ChatRequest): Promise<ChatOnceResult> => instance!.chatOnce(uid, req),
+    chatOnce: (uid: string, lv: string, req: ChatRequest): Promise<ChatOnceResult> => instance!.chatOnce(uid, lv, req),
     dispose: (): void => instance!.dispose(),
     generateLoginUrl: (): string => instance!.generateLoginUrl(),
     completeLogin: (url: string): Promise<{ uid: string; nickname: string }> => instance!.completeLogin(url),

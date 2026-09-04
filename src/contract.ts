@@ -120,7 +120,7 @@ export interface SupplierModule {
    * 失败原因通过返回值的 `message` 报（核心测试模型时直接拿它做诊断提示），
    * 插件不必维护「上次失败」的状态。
    */
-  chatOnce(uid: string, req: ChatRequest): Promise<ChatOnceResult>
+  chatOnce(uid: string, lv: string, req: ChatRequest): Promise<ChatOnceResult>
   dispose(): void
 
   // ---- 差异化能力（可选） ----

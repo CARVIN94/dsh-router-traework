@@ -39,7 +39,7 @@ export interface Supplier {
   listModels(force?: boolean): Promise<ModelInfo[]> | ModelInfo[]
   modelsWithEnabled(): Promise<ModelWithEnabled[]> | ModelWithEnabled[]
   customModelIds?(): string[]
-  chatOnce(uid: string, req: ChatRequest): Promise<ChatOnceResult>
+  chatOnce(uid: string, lv: string, req: ChatRequest): Promise<ChatOnceResult>
   removeLink?(uid: string): Promise<boolean>
   dispose(): void
 }

@@ -64,7 +64,7 @@ async function streamToolArgs(outputs: string[]): Promise<Array<{ index: number;
   const sup = new TraeworkSupplier({ stateFile: '' }, fakeStore(), creds, () => {})
   await sup.start()
   try {
-    const r = await sup.chatOnce('u1', {
+    const r = await sup.chatOnce('u1', 'auto', {
       model: 'glm-5.2',
       stream: true,
       rawBody: JSON.stringify({ model: 'glm-5.2', messages: [{ role: 'user', content: 'hi' }], stream: true }),
@@ -172,7 +172,7 @@ async function streamFrames(sseText: string): Promise<Array<Record<string, any>>
   const sup = new TraeworkSupplier({ stateFile: '' }, fakeStore(), creds, () => {})
   await sup.start()
   try {
-    const r = await sup.chatOnce('u1', {
+    const r = await sup.chatOnce('u1', 'auto', {
       model: 'glm-5.2',
       stream: true,
       rawBody: JSON.stringify({ model: 'glm-5.2', messages: [{ role: 'user', content: 'hi' }], stream: true }),

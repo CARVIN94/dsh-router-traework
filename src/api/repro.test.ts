@@ -45,7 +45,7 @@ async function streamToolArgs(outputs: string[]): Promise<Array<{ index: number;
   const sup = new TraeworkSupplier({ stateFile: '' }, fakeStore(), creds, () => {})
   await sup.start()
   try {
-    const r = await sup.chatOnce('u1', { model: 'glm-5.2', stream: true, rawBody: JSON.stringify({ model: 'glm-5.2', messages: [{ role: 'user', content: 'hi' }], stream: true }) })
+    const r = await sup.chatOnce('u1', 'auto', { model: 'glm-5.2', stream: true, rawBody: JSON.stringify({ model: 'glm-5.2', messages: [{ role: 'user', content: 'hi' }], stream: true }) })
     assert.equal(r.ok, true, JSON.stringify(r))
     if (!('stream' in r)) throw new Error('expected stream')
     const reader = r.stream.getReader()
