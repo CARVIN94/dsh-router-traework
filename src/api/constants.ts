@@ -21,6 +21,14 @@ export const SOLO = {
   DeviceBrand: '83DG',
   OSVersion: 'Windows 11 Pro',
   Function: 'solo_work_lite',
+  /**
+   * 签到/积分（api.trae.cn）走的是 **VSCode 插件进程**，UA 与 IDE 主进程的
+   * `Trae/0.1.61`(CLIENT_UA)、`TraeClient/TTNet` 都不同（2026-09-03 抓包实测）。
+   * 三者混用 = 同一账号出现三套客户端身份，风控画像对不上。
+   */
+  UgUserAgent: 'VSCode 1.107.1 (TRAE SOLO CN)',
+  /** X-Market-Client-Id 与 UA 同源但**不带 CN 后缀**（实测值）。 */
+  MarketClientId: 'VSCode 1.107.1',
 
   // 端点
   EpChat: '/api/agent/v3/llm_utils_chat',

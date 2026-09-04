@@ -7,9 +7,29 @@
 import { randomBytes } from 'node:crypto'
 import { SOLO } from './constants.ts'
 
-/** 生成 hex32 machine/device id。 */
+/** 生成 hex32 machine id（真实客户端 machine_id 就是 32 字节 hex，抓包实证）。 */
 export function randomId(): string {
   return randomBytes(16).toString('hex')
+}
+
+/**
+ * 生成 16 位纯数字 device id。
+ *
+ * 形态必须对齐真实客户端（2026-09-03 抓包实测 x-device-id = `1711320556112436`，
+ * 16 位纯数字）。旧实现发 hex32，在风控眼里根本不是一个设备号——
+ * TRAE-Automatic-sign-in 也注明「必须用 16 位数字 Aha 设备号，用 GUID/UUID 会
+ * 触发 9074」。
+ *
+ * **16 位要均匀随机，不能用 `10^15 + rand` 那种写法**：后者把高位钉死在
+ * `1xxxxx`，批量生成的号摆一起共享可识别的前缀（实测迁移出来的三个号前几位
+ * 都是 107/113/117），等于主动给风控递「同一生成器批发」的特征。
+ * 首位取 1-9（不能是 0，否则不是 16 位），后 15 位逐位均匀取 0-9。
+ */
+export function newDeviceId(): string {
+  const digits = randomBytes(16)
+  let out = String(1 + (digits[0]! % 9)) // 首位 1-9，保证恰好 16 位
+  for (let i = 1; i < 16; i++) out += String(digits[i]! % 10)
+  return out
 }
 
 /**

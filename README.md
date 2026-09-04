@@ -75,6 +75,21 @@ dsh plugin --profile web add dsh-router-traework
 - `checked_in` 是**当前登录态设备**的读数，换 deviceId 会短暂变 `false`，
   那是缓存假象，不代表「这个账号今天还能再签一次」
 - 判重维度是**账号**不是设备：换 deviceId 后 `checked_in` 依然是 `true`
+  （所以存量凭证把 deviceId 一次性迁到真实形态是安全的，不会重复签到）
+
+### 剩余积分的计算
+
+`ide_user_ent_usage` 返回 `user_entitlement_pack_list`，剩余 = Σ(`credits_limit`
+- `credits_amount`)。实测要点：
+
+- **请求体必须是 `{"require_usage":true,"req_source":2}`**，发 `{}` 拿不到完整 usage
+- **过期包必须跳过**：签到积分是当日发放、**31 天后过期**的独立包
+  （`entitlement_id` 形如 `checkin_20260902_<uid>`，每个 200 额度）。不滤掉
+  就是把历史所有签到包累加进「剩余」，面板越签越多、永远用不完
+- 请求头与 chat 链路**不是同一套身份**：签到/积分走 VSCode 插件进程
+  （UA `VSCode 1.107.1 (TRAE SOLO CN)`），chat 走 IDE 主进程
+- `x-device-id` 必须是 **16 位纯数字**（真实客户端实测值如 `1711320556112436`），
+  发 hex32 / UUID 在风控眼里不是设备号
 
 ### 9074 的真相（2026-09-02 实测订正，旧文档写「抖动，重试即过」是错的）
 

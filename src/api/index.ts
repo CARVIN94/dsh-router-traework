@@ -22,9 +22,10 @@ import {
   linesFromStream,
   parseSoloLine,
   SoloStreamError,
+  isRealDeviceId,
 } from './upstream.ts'
 import { Scheduler } from './scheduler.ts'
-import { buildLoginUrl, newMarketUserId, parseLoginCallback, randomId } from './login.ts'
+import { buildLoginUrl, newMarketUserId, newDeviceId, parseLoginCallback, randomId } from './login.ts'
 import type { Supplier, ModelInfo, ModelWithEnabled, ChatRequest } from '../types.ts'
 import type { AccountState, ChatOnceResult, SupplierStatusNow } from '../contract.ts'
 
@@ -160,13 +161,23 @@ export class TraeworkSupplier implements Supplier {
         const doc = this.credentials.get<unknown>(this.id, uid)
         if (doc === undefined) continue
         const a: Auth = { ...parseAuth(JSON.stringify(doc)), filePath: '' }
-        // 老凭证补 marketUserId：该字段是后加的（服务端不提供，只能本地生成），
-        // 存量账号没有它 → ugHeaders 不发 X-Market-User-Id，指纹比新登录的
-        // 账号少一头。补一次并落盘，之后每次启动都是同一个稳定值。
+        // 老凭证补 marketUserId / deviceId：两者都是后加的（服务端不提供，
+        // 只能本地生成），存量账号缺它们 → ugHeaders 指纹比新账号少一头。
+        // 补一次并落盘，之后每次启动都是同一个稳定值。
+        let dirty = false
         if (a.marketUserId === undefined || a.marketUserId === '') {
           a.marketUserId = newMarketUserId()
-          this.saveAuth(a)
+          dirty = true
         }
+        // hex32 deviceId 是历史遗留（2026-09-04 订正）：真实客户端发 16 位
+        // 纯数字，我们以前发 hex32，在风控眼里不是一个设备号。存量账号
+        // 换一次号——它不参与判重（判重维度是账号，实测换新 id 后
+        // checked_in 仍为 true），换了不会重复签到。
+        if (!isRealDeviceId(a.deviceId)) {
+          a.deviceId = newDeviceId()
+          dirty = true
+        }
+        if (dirty) this.saveAuth(a)
         out.push(a)
       } catch {
         // 坏凭证静默跳过
@@ -352,8 +363,8 @@ export class TraeworkSupplier implements Supplier {
 
   /** 生成登录链接并记住本次 machine/device id（回调完成时复用）。 */
   generateLoginUrl(): string {
-    const machineId = randomId()
-    const deviceId = randomId()
+    const machineId = randomId() // hex32（真实客户端形态）
+    const deviceId = newDeviceId() // 16 位纯数字（真实客户端形态）
     this.pendingLogin = { machineId, deviceId }
     return buildLoginUrl(machineId, deviceId)
   }

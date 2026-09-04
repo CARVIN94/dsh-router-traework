@@ -43,6 +43,18 @@ const CHECKIN_BUSY_CODE = 9074
 const CHECKIN_BUSY_RETRY_MS = 1000
 
 /**
+ * ide_user_ent_usage 的请求体（2026-09-03 抓包实测）。
+ * 真实客户端就发这两个字段；发空对象 `{}` 拿到的 usage 不完整。
+ */
+const ENT_USAGE_BODY = { require_usage: true, req_source: 2 } as const
+
+/** 过期判定：end_time/expire_time 为 Unix 秒，缺失或 0 视作不过期。 */
+function hasExpired(endTime: number | undefined, nowSec: number): boolean {
+  const t = Number(endTime ?? 0)
+  return t > 0 && t <= nowSec
+}
+
+/**
  * 上游「自定义模型」config_name 前缀：这类是用户在 TRAE 云端挂的第三方
  * 代理（base_url 指向别处），不属于本供应商配额，发过去就在流里报 4023。
  * 上游的 is_custom_model 标志不可靠（实测全为 false），只能靠前缀兜底。
@@ -135,21 +147,25 @@ function genTTTraceId(requestId: string): string {
 
 /**
  * UgHeaders：签到/积分（api.trae.cn）所需头。
- * 与真实 TRAE 客户端逐头对齐（2026-09-03 抓包实测成功账号的请求头）。
- * 伪装身份：Windows + Trae{version}（与 soloHeaders 自洽，避免设备信息矛盾）。
+ * 逐头对齐 2026-09-03 抓包的**成功**签到请求（trae-capture/parsed_flows.jsonl）。
+ *
+ * 伪装身份必须是 VSCode 插件进程，不是 IDE 主进程——这两条链路的 UA 不同
+ * （实测：llm_utils_chat 走 TraeClient/TTNet，签到/积分走
+ * `VSCode 1.107.1 (TRAE SOLO CN)`）。用 CLIENT_UA(`Trae/0.1.61`) 属于
+ * 第三套不存在的身份，风控画像直接对不上。
  */
 export function ugHeaders(a: Auth): Record<string, string> {
   const requestId = genUuid()
   const h: Record<string, string> = {
     'Content-Type': 'application/json',
-    Accept: 'application/json',
-    'User-Agent': CLIENT_UA,
+    Accept: '*/*', // 实测值；不是 application/json
+    'User-Agent': SOLO.UgUserAgent,
     Authorization: `Cloud-IDE-JWT ${a.accessToken}`,
     'X-User-Region': 'CN',
     'Accept-Language': 'zh-CN',
     'Package-Type': 'stable_cn',
     'X-Lgw-Req-Sdk-Type': '3',
-    'X-Market-Client-Id': CLIENT_UA,
+    'X-Market-Client-Id': SOLO.MarketClientId, // 'VSCode 1.107.1'（不含 CN 后缀）
     'X-Device-Brand': SOLO.DeviceBrand,
     'X-Device-Type': 'windows',
     'X-OS-Version': SOLO.OSVersion,
@@ -157,13 +173,17 @@ export function ugHeaders(a: Auth): Record<string, string> {
     'X-Request-Id': requestId,
     'X-TT-Trace-Id': genTTTraceId(requestId),
     'Sec-Fetch-Dest': 'empty',
-    'Sec-Fetch-Mode': 'cors',
+    'Sec-Fetch-Mode': 'no-cors', // 实测值；不是 cors
     'Sec-Fetch-Site': 'none',
   }
   if (a.deviceId !== '') h['X-Device-Id'] = a.deviceId
-  if (a.uid !== '') h['X-Uid'] = a.uid
   if (a.marketUserId) h['X-Market-User-Id'] = a.marketUserId
   return h
+}
+
+/** deviceId 是否是真实客户端形态（15~16 位纯数字）。hex32 是历史遗留，见 login.ts。 */
+export function isRealDeviceId(id: string): boolean {
+  return /^\d{15,16}$/.test(id)
 }
 
 /** OAuthHeaders：ExchangeToken / GetUserInfo 所需头（无签名，仅 UA）。 */
@@ -725,20 +745,33 @@ export class SoloClient {
     }
   }
 
-  /** 剩余积分：聚合 (credits_limit - credits_amount)（credits_amount 是已用积分，实测）。 */
+  /**
+   * 剩余积分：聚合**未过期**包的 (credits_limit - credits_amount)。
+   *
+   * 请求体必须带 require_usage/req_source（2026-09-03 抓包实测真实客户端发的是
+   * `{"require_usage":true,"req_source":2}`，不是 `{}`）。
+   *
+   * 过期包必须跳过：签到积分是**当日发放、31 天后过期**的独立包
+   * （实测 entitlement_id 形如 checkin_20260902_<uid>，每个包各 200 额度）。
+   * 不过滤就是把历史上所有签到包的额度都算进「剩余」，面板越签越多、永远
+   * 用不完，且掩盖真实余额。end_time/expire_time 缺失时按「不过期」保留。
+   */
   async userEntUsage(a: Auth): Promise<number> {
-    const data = await this.doJSON(this.ugHost + SOLO.EpEntUsage, ugHeaders(a), {})
+    const data = await this.doJSON(this.ugHost + SOLO.EpEntUsage, ugHeaders(a), ENT_USAGE_BODY)
     const list = (data as { user_entitlement_pack_list?: unknown[] })?.user_entitlement_pack_list ?? []
+    const nowSec = Math.floor(Date.now() / 1000)
     let remain = 0
     for (const p of list) {
       const pack = p as {
-        entitlement_base_info?: { quota?: { credits_limit?: number } }
+        entitlement_base_info?: { quota?: { credits_limit?: number }; end_time?: number }
+        expire_time?: number
         usage?: { credits_amount?: number }
       }
       const limit = Number(pack.entitlement_base_info?.quota?.credits_limit ?? 0)
       if (limit <= 0) continue
+      if (hasExpired(pack.entitlement_base_info?.end_time ?? pack.expire_time, nowSec)) continue
       const used = Number(pack.usage?.credits_amount ?? 0)
-      remain += limit - used
+      remain += Math.max(0, limit - used)
     }
     return remain
   }
