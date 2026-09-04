@@ -5,6 +5,7 @@
 <p align="center">
   <a href="https://www.npmjs.com/package/dsh-router-traework"><img src="https://img.shields.io/npm/v/dsh-router-traework?style=flat-square&logo=npm&label=npm" alt="npm version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-10b981?style=flat-square" alt="MIT license"></a>
+  <a href="https://www.npmjs.com/package/@deepseek-ai/dsh?activeTab=versions"><img alt="支持的 DSH 版本：0.1.2-rc.1+" src="https://img.shields.io/badge/DSH-0.1.2--rc.1%2B-4d6bfe" /></a>
 </p>
 
 <p align="center">
@@ -121,3 +122,7 @@ pnpm test         # node --test "src/**/*.test.ts"
 ## 许可证
 
 [MIT](LICENSE)
+
+## 免责声明
+
+本项目仅用于学习与技术研究，请勿用于商业用途。
