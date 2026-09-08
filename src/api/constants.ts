@@ -2,6 +2,7 @@
  * TRAE SOLO 上游技术常量（SPEC §1，来自实测，禁止改动）。
  * 移植自 traework2api/internal/upstream/constants.go。
  */
+import { join } from 'node:path'
 
 export const SOLO = {
   AgentHost: 'https://trae-api-cn.mchost.guru',
@@ -65,7 +66,15 @@ export interface TraewConfig {
   oauthHost?: string
 }
 
-export function defaultConfig(env: NodeJS.ProcessEnv = process.env): TraewConfig {
+/**
+ * 默认配置（对应 traework2api cmd/server/config.go）。
+ *
+ * `dataDir` 是 dsh-router 核心注入的**绝对**数据目录（`~/.dsh/profiles/<name>/data`）。
+ * 以前这里写死相对路径 `data/state.json`，落盘位置跟着进程 cwd 跑——从别的目录
+ * 启动 `dsh web` 就静默换一套空数据。必须从核心拿，不要自己拼。
+ */
+export function defaultConfig(dataDir = ''): TraewConfig {
+  const env = process.env
   const num = (v: string | undefined, d: number): number => {
     const n = Number(v)
     return Number.isFinite(n) && n > 0 ? n : d
@@ -75,8 +84,8 @@ export function defaultConfig(env: NodeJS.ProcessEnv = process.env): TraewConfig
     .map((s) => Number(s.trim()))
     .filter((n) => Number.isInteger(n) && n >= 0 && n <= 23)
   return {
-    authDir: env.TW2A_AUTH_DIR ?? 'auths',
-    stateFile: env.TW2A_STATE_FILE ?? 'data/state.json',
+    authDir: dataDir !== '' ? join(dataDir, 'auths') : 'auths',
+    stateFile: dataDir !== '' ? join(dataDir, 'state.json') : 'data/state.json',
     apiKey: env.TW2A_API_KEY ?? '',
     defaultModel: env.TW2A_DEFAULT_MODEL ?? DEFAULT_CONFIG_NAME,
     planCooldownMs: 12 * 3600_000,

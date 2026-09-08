@@ -85,6 +85,11 @@ export function classify(status: number, body: string): ErrKind {
   if (body.includes('"code":1005') || (body.includes('1005') && lower.includes('plan'))) {
     return 'plan_limit'
   }
+  // 额度类业务码（1005/4008）有可能裹在非 2xx 的响应体里，这里与流内共用
+  // 同一张判定表，避免两条路径对一个码给出两种语义。
+  for (const c of PLAN_LIMIT_CODES) {
+    if (body.includes(`"code":${c}`)) return 'plan_limit'
+  }
   if (status === 401) return 'session_dead'
   if (status === 429) return 'soft_rate'
   if (status === 404) return 'not_found'
@@ -404,7 +409,15 @@ export function scanLine(st: { event: string; data: string }, line: string): Sol
   return undefined
 }
 
-/** SOLO 流内业务错误。 */
+/**
+ * 流内业务码 → 语义分类。
+ *
+ * 只认 `1005` 是历史遗留，实测不够：TRAE 对「该账号没这个模型的配额」发
+ * **HTTP 200 + 流内 code=4008**（`Your requests have exceeded the quota`）
+ * ——2026-09-08 实测三个号里两个如此（其中一个面板还有 200 积分，说明这个
+ * 配额与积分余额是两回事）。把它归进 `'client'` 就等于判成「客户端参数错」，
+ * 核心按 `unknown` 只冷 30s，坏号转头又被选中。
+ */
 export class SoloStreamError extends Error {
   code: number
   constructor(code: number, msg: string) {
@@ -412,8 +425,15 @@ export class SoloStreamError extends Error {
     this.code = code
   }
   kind(): ErrKind {
-    return this.code === 1005 ? 'plan_limit' : 'client'
+    return streamCodeKind(this.code)
   }
+}
+
+/** 流内业务码集合 → 分类（HTTP 层 classify 与流内 kind() 共用同一张表）。 */
+const PLAN_LIMIT_CODES = new Set([1005, 4008])
+
+function streamCodeKind(code: number): ErrKind {
+  return PLAN_LIMIT_CODES.has(code) ? 'plan_limit' : 'client'
 }
 
 function mergeToolCallDelta(merged: Record<string, unknown>, delta: Record<string, unknown>): void {

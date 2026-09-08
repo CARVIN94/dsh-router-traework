@@ -13,7 +13,7 @@ import {
 } from './constants.ts'
 import { needsRefresh, parseAuth, toAuthDoc, type Auth } from './auth.ts'
 import { Pool, type AccountStatus, type PoolStrategy } from './pool.ts'
-import type { SupplierConfigStoreLike, CredentialStoreLike } from '../contract.ts'
+import type { SupplierConfigStoreLike, CredentialStoreLike, SupplierEnvLike } from '../contract.ts'
 import {
   SoloClient,
   UpstreamError,
@@ -99,10 +99,16 @@ export class TraeworkSupplier implements Supplier {
   private modelsCache: ModelInfo[] | undefined
   /** 上次 chatOnce 失败原因（供核心测试模型汇总诊断）。 */
   private pendingLogin: { machineId: string; deviceId: string } | undefined
+  /**
+   * 迟到失败上报通道（核心注入，可能没有——老核心/独立运行时没有这个字段）。
+   * **调用时才读**：核心是先跑 factory 再挂这个回调的，构造时读必是 undefined。
+   */
+  private env: SupplierEnvLike
 
-  constructor(cfg: Partial<TraewConfig>, store: SupplierConfigStoreLike, credentials: CredentialStoreLike, log?: (msg: string) => void) {
+  constructor(cfg: Partial<TraewConfig>, store: SupplierConfigStoreLike, credentials: CredentialStoreLike, log?: (msg: string) => void, env?: SupplierEnvLike) {
     this.log = log ?? (() => {})
-    this.cfg = { ...defaultConfig(), ...cfg }
+    this.env = env ?? {}
+    this.cfg = { ...defaultConfig(env?.dataDir ?? ''), ...cfg }
     this.store = store
     this.credentials = credentials
     this.pool = new Pool(this.cfg.stateFile, {
@@ -490,14 +496,19 @@ export class TraeworkSupplier implements Supplier {
 
     // 流式：SOLO SSE → OpenAI SSE 后交回核心写（响应头已写即绑死，见核心注释）
     if (req.stream) {
-      // 流中途出错也要让核心记账（作用于后续请求）
-      return { ok: true, stream: this.soloToOpenAI(streamRes.body, (se) => this.noteMidStream(uid, se)) }
+      // 流中途出错：响应头已写出无法回退，但必须上报核心记账（作用于后续请求）。
+      // 上报用**剥掉供应商前缀后的模型 id**——核心的冷却键是
+      // (supplier, modelId, uid)，核心记账用的正是它剥好的 modelId
+      // （chatWithModel 里 clone.model = modelId）。这里直接拿插件已解析出的
+      // configName 最准：它就是最终发给上游、也是核心认的那个 id。
+      return { ok: true, stream: this.soloToOpenAI(streamRes.body, (se) => this.noteMidStream(uid, configName, se)) }
     }
 
     // 非流式：聚合后判空——空响应视为失败，让核心换号/换模型回退
     const { response, error } = await aggregate(linesFromStream(streamRes.body))
     if (error) {
-      this.noteMidStream(uid, error)
+      // 只记日志：响应尚未提交，核心拿到返回值会自己 noteFailure（再报就是双记）
+      this.logMidStream(error)
       return { ok: false, state: this.stateOf(error.kind()), message: error.message }
     }
     const msg = (response as { choices?: Array<{ message?: Record<string, unknown> }> })?.choices?.[0]?.message
@@ -523,11 +534,33 @@ export class TraeworkSupplier implements Supplier {
     }
   }
 
-  /** 流中途/聚合时才发现的错误：核心已提交响应，这里只记日志（核心的池管不了已提交的流）。 */
-  private noteMidStream(uid: string, se: SoloStreamError): void {
-    void uid
+  private logMidStream(se: SoloStreamError): void {
     if (se.kind() === 'plan_limit') {
       this.log(`traework: account plan limit (mid-stream): ${se.message}`)
+    }
+  }
+
+  /**
+   * 流中途才发现的错误：响应头已写出（流式一旦开始就绑死），这次请求救不回来
+   * 了 —— 但**「这个号坏了」必须让核心知道**，否则它继续留在池里被轮转选中，
+   * 每次都白撞同一个错误（实测三选二的号全废 = 2/3 请求直接失败）。
+   *
+   * 经 `env.onLateFailure` 上报（核心实现 = `pool.noteFailure`），作用于
+   * **后续**请求：按语义状态冷却/禁用，坏号随即退出轮转。
+   * 拿不到这个通道（老核心/独立运行时）就只记日志，退化成旧行为。
+   *
+   * **仅限流式**：非流式路径响应尚未提交，核心会自己 `noteFailure`，
+   * 这里再报一次就是双记 —— `rate_limit` 是指数退避，多记一次会多跳一级。
+   */
+  private noteMidStream(uid: string, model: string, se: SoloStreamError): void {
+    this.logMidStream(se)
+    const report = this.env.onLateFailure
+    if (report === undefined || uid === '') return
+    try {
+      report(uid, model, this.stateOf(se.kind()), se.message)
+    } catch (err) {
+      // 上报失败绝不能影响这次响应（流还在写）
+      this.log(`traework: onLateFailure 上报失败: ${(err as Error).message}`)
     }
   }
 

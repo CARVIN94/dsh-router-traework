@@ -41,6 +41,23 @@ export interface CredentialStoreLike {
 }
 
 /**
+ * 核心注入的运行时环境中，本插件真正用到的部分。
+ *
+ * `onLateFailure` 是迟到失败上报（流式响应已提交后才发现的错误）。核心是
+ * **先跑 factory 再挂这个回调**的，所以插件必须在**调用时**读它，不能在
+ * 构造函数里缓存 —— 构造时读必是 undefined。
+ */
+export interface SupplierEnvLike {
+  /**
+   * 核心注入的**绝对**数据目录（`~/.dsh/profiles/<name>/data`）。
+   * 插件一律从这里派生自己的落盘路径，绝不写相对路径——相对路径会跟着
+   * 进程 cwd 跑，换目录启动就静默换一套空数据。
+   */
+  dataDir?: string
+  onLateFailure?: (uid: string, model: string, state: AccountState, message: string) => void
+}
+
+/**
  * 账户此刻的状态 —— 插件**解读**上游信号后的语义状态。
  * 插件只报「现在怎么了」，不说「该怎么办」：冷却多久、是否禁用、要不要换号
  * 都是核心的策略。
@@ -99,6 +116,16 @@ export interface SupplierEnv {
   store: SupplierConfigStoreLike
   /** 通用凭证存储。 */
   credentials: CredentialStoreLike
+  /**
+   * 迟到的失败上报（可选）——**只在响应已提交之后**才用。
+   *
+   * 流式请求一旦写出第一个字节就绑死（HTTP 语义），此时上游再报错已经换不了
+   * 号、也改不了状态码。但「这个号坏了」对**后续**请求仍有用：不报上来它就会
+   * 继续留在池里被轮转选中（实测：TRAE 三个号里两个被拒 code=4008，round-robin
+   * 下 2/3 请求直接失败）。核心实现 = `pool.noteFailure`，按状态冷却/禁用。
+   * 插件拿不到也不用兜底：不调用就退化成今天的行为。
+   */
+  onLateFailure?: (uid: string, model: string, state: AccountState, message: string) => void
 }
 
 /** 供应商模块 —— 契约（核心必须，差异化可选）。 */
