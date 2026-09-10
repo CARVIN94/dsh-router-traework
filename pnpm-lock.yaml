@@ -9,7 +9,7 @@ importers:
   .:
     dependencies:
       '@deepseek-ai/cordis':
-        specifier: ^4.0.1
+        specifier: ^4.0.2
         version: 4.0.2
       cordis:
         specifier: ^4.0.0-rc.7

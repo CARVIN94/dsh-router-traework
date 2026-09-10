@@ -5,7 +5,7 @@
 <p align="center">
   <a href="https://www.npmjs.com/package/dsh-router-traework"><img src="https://img.shields.io/npm/v/dsh-router-traework?style=flat-square&logo=npm&label=npm" alt="npm version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-10b981?style=flat-square" alt="MIT license"></a>
-  <a href="https://www.npmjs.com/package/@deepseek-ai/dsh?activeTab=versions"><img alt="支持的 DSH 版本：0.1.2-rc.1+" src="https://img.shields.io/badge/DSH-0.1.2--rc.1%2B-4d6bfe" /></a>
+  <a href="https://www.npmjs.com/package/@deepseek-ai/dsh?activeTab=versions"><img alt="支持的 DSH 版本：0.1.5-rc.1+" src="https://img.shields.io/badge/DSH-0.1.5--rc.1%2B-4d6bfe" /></a>
 </p>
 
 <p align="center">
@@ -22,7 +22,7 @@
 
 ## 快速安装
 
-先装核心，再装本插件，然后**重启 `dsh web`**：
+需要 **DSH `0.1.5-rc.1` 及以上**。先装核心，再装本插件，然后**重启 `dsh web`**：
 
 ```bash
 dsh plugin --profile web add dsh-router-core
