@@ -57,8 +57,6 @@ export interface TraewConfig {
   errThreshold: number
   errCooldownMs: number
   refreshSkewMs: number
-  checkinHour: number
-  refreshHours: number[]
   timeoutSeconds: number
   /** 覆盖上游 host（测试用）。 */
   agentHost?: string
@@ -79,10 +77,6 @@ export function defaultConfig(dataDir = ''): TraewConfig {
     const n = Number(v)
     return Number.isFinite(n) && n > 0 ? n : d
   }
-  const refreshHours = (env.TW2A_REFRESH_HOURS ?? '3')
-    .split(',')
-    .map((s) => Number(s.trim()))
-    .filter((n) => Number.isInteger(n) && n >= 0 && n <= 23)
   return {
     authDir: dataDir !== '' ? join(dataDir, 'auths') : 'auths',
     stateFile: dataDir !== '' ? join(dataDir, 'state.json') : 'data/state.json',
@@ -93,8 +87,6 @@ export function defaultConfig(dataDir = ''): TraewConfig {
     errThreshold: num(env.TW2A_ERR_THRESHOLD, 3),
     errCooldownMs: 10 * 60_000,
     refreshSkewMs: 24 * 3600_000,
-    checkinHour: num(env.TW2A_CHECKIN_HOUR, 9),
-    refreshHours: refreshHours.length > 0 ? refreshHours : [3],
     timeoutSeconds: num(env.TW2A_TIMEOUT_SECONDS, 120),
     agentHost: env.TW2A_SOLO_AGENT_HOST,
     ugHost: env.TW2A_SOLO_UG_HOST,

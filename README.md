@@ -52,6 +52,11 @@ dsh plugin --profile web add dsh-router-traework
 - 积分只报**值**，不落盘（持久化归核心 `supplier-config.json`）：启动时用核心
   缓存预热，拿不到时报 `-1`（不是 0），核心保留上次持久化的值
 
+**本插件不做自动调度**：不挂后台定时器。签到是核心在用户点「签到」时逐个
+链接触发的（`POST /suppliers/:id/checkin` → `checkinNow(uid)`），token 刷新走
+`chatOnce` 触发式路径。曾移植自 traework2api 的每日自动签到 `Scheduler` 已删除
+（核心没有定时入口，放着是死代码）。
+
 完整契约见 [dsh-router 的 `docs/suppliers.md`](https://github.com/CARVIN94/dsh-router/blob/main/docs/suppliers.md)。
 
 ## 签到判定
@@ -115,7 +120,7 @@ src/
   index.ts       插件入口（提供 router.suppliers service）
   contract.ts    供应商契约
   types.ts       类型定义
-  api/           供应商实现（上游客户端、账号凭证池、调度器、登录等）
+  api/           供应商实现（上游客户端、账号凭证池、登录、签到能力等）
 ```
 
 ## 开发
@@ -130,7 +135,8 @@ pnpm test         # node --test "src/**/*.test.ts"
 ## 致谢
 
 - [Sliverkiss/traework2api](https://github.com/Sliverkiss/traework2api) —— 本插件的
-  直接移植来源：上游客户端、登录流程、定时任务与常量表都来自它;
+  直接移植来源：上游客户端、登录流程与常量表都来自它（其内置的每日自动签到
+  `Scheduler` 因本插件不做自动调度已删除）;
 - [rockswang/wild-work](https://github.com/rockswang/wild-work) —— 签到语义的参考:
   `checkin_credits` 的业务码含义、以及「成败只看 body code、积分不能当凭据」
   这些判定规则的来源;

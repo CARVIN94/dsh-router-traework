@@ -27,7 +27,7 @@ export default function factory(env: SupplierEnv): SupplierModule & { removeLink
     // env 整个传进去：插件在**调用时**才读 env.onLateFailure（核心是先跑
     // factory 再挂这个回调的，构造时读必是 undefined）。
     instance = new TraeworkSupplier({}, env.store, env.credentials, env.log, env)
-    // 加载即启动：扫凭证、起调度器、刷积分（失败不阻断）
+    // 加载即启动：扫凭证、刷积分（失败不阻断；不挂自动调度器，签到/刷新都是触发式）
     void instance.start().catch((err: unknown) => {
       env.log(`traework start: ${(err as Error).message}`)
     })

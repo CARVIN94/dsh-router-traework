@@ -11,7 +11,7 @@ import {
   SOLO,
   type TraewConfig,
 } from './constants.ts'
-import { needsRefresh, parseAuth, toAuthDoc, type Auth } from './auth.ts'
+import { parseAuth, toAuthDoc, type Auth } from './auth.ts'
 import { Pool, type AccountStatus, type PoolStrategy } from './pool.ts'
 import type { SupplierConfigStoreLike, CredentialStoreLike, SupplierEnvLike } from '../contract.ts'
 import {
@@ -24,7 +24,6 @@ import {
   SoloStreamError,
   isRealDeviceId,
 } from './upstream.ts'
-import { Scheduler } from './scheduler.ts'
 import { buildLoginUrl, newMarketUserId, newDeviceId, parseLoginCallback, randomId } from './login.ts'
 import type { Supplier, ModelInfo, ModelWithEnabled, ChatRequest } from '../types.ts'
 import type { AccountState, ChatOnceResult, SupplierStatusNow } from '../contract.ts'
@@ -82,7 +81,6 @@ export class TraeworkSupplier implements Supplier {
   private cfg: TraewConfig
   private pool: Pool
   private client: SoloClient
-  private scheduler: Scheduler
   /** 积分拉取时间（uid → ms）：status() 同步返回池里的值，过期后台异步刷新。
    *  积分本身由核心持久化（supplier-config.json），这里只管内存 TTL。 */
   private creditsAt = new Map<string, number>()
@@ -123,25 +121,17 @@ export class TraeworkSupplier implements Supplier {
       oauthHost: this.cfg.oauthHost,
       timeoutSeconds: this.cfg.timeoutSeconds,
     })
-    this.scheduler = new Scheduler({
-      pool: this.pool,
-      client: this.client,
-      checkinHour: this.cfg.checkinHour,
-      refreshHours: this.cfg.refreshHours,
-      refreshSkewMs: this.cfg.refreshSkewMs,
-      saveAuth: (a) => this.saveAuth(a),
-      log,
-    })
   }
 
-  /** 启动：从 dsh-router 凭证存储加载、启动调度器、初始化积分。 */
+  /** 启动：从 dsh-router 凭证存储加载、初始化积分。不再起任何自动任务——
+   *  签到是核心的活（POST /suppliers/:id/checkin 手动触发），token 刷新走
+   *  chatOnce 触发式路径，插件不挂后台定时器。 */
   async start(): Promise<void> {
     const auths = this.loadAuths()
     this.pool.syncToDir(auths)
     // 积分现在由核心持久化（supplier-config.json），这里拿它预热内存：
     // 异步拉完之前面板就有数，不必等第一次网络往返。
     this.seedCreditsFromCoreCache()
-    this.scheduler.start()
     this.refreshCredits()
   }
 
@@ -198,7 +188,7 @@ export class TraeworkSupplier implements Supplier {
   }
 
   dispose(): void {
-    this.scheduler.stop()
+    // 无后台任务需要清理——签到/刷新都是触发式，不挂定时器
   }
 
   status(): SupplierStatusNow {
@@ -306,12 +296,57 @@ export class TraeworkSupplier implements Supplier {
     return { ok: true }
   }
 
-  /** 单链接签到：遍历所有链接 + 汇总是 dsh-router 核心的活，这里只签一个 uid。 */
-  async checkinNow(uid: string): Promise<{ ok: boolean; status: string; message?: string }> {
-    const r = await this.scheduler.checkinOne(uid)
-    // scheduler 签到后会重新拉积分写回池，这里同步时间戳避免 status() 立刻重拉
-    if (r.status === 'ok' || r.status === 'already') this.creditsAt.set(uid, Date.now())
-    return r
+  /** 单链接签到：遍历所有链接 + 汇总是 dsh-router 核心的活，这里只签一个 uid。
+   *  真实语义（参考 traework2api / wild-work）：
+   *    status 判定：checked_in=true → 今日已签；!enable → 未开放；
+   *    仅 !checkedIn && enable 才 claim，claim 后**重查 status 确认**才算成功。
+   *
+   *  为什么必须回查：积分（user_ent_usage）是**所有包**的聚合剩余额度，
+   *  实测某账号签到前后都是同一个数——拿它判成败会谎报「签到成功」。
+   *  只有 status.checked_in 是这次签到的真凭据。 */
+  async checkinNow(uid: string): Promise<{ ok: boolean; status: 'ok' | 'already' | 'disabled' | 'error'; message?: string }> {
+    const st = this.pool.list().find((s) => s.uid === uid)
+    if (st === undefined) return { ok: false, status: 'error', message: '链接不存在' }
+    const a = this.pool.authByUID(uid)
+    if (!a || a.refreshToken === '') return { ok: false, status: 'error', message: '凭证缺失' }
+    try {
+      const status = await this.client.checkinStatus(a)
+      if (status.checkedIn) {
+        await this.refreshCreditsAfterCheckin(uid, a)
+        // 今日已签到（traework 服务端 1 天 1 次），幂等成功
+        this.creditsAt.set(uid, Date.now())
+        return { ok: true, status: 'already', message: '今日已签到' }
+      }
+      if (!status.enable) {
+        return { ok: false, status: 'disabled', message: '今日签到未开放' }
+      }
+      const claimed = await this.client.checkinClaim(a)
+      this.log(`checkin ${uid}: ${claimed}`)
+      // 回查：claim 返回 0 也不代表真签上了，checked_in 才是凭据
+      const after = await this.client.checkinStatus(a)
+      await this.refreshCreditsAfterCheckin(uid, a)
+      if (!after.checkedIn) {
+        return { ok: false, status: 'error', message: '签到未生效：上游未标记已签到' }
+      }
+      // 上游按账号判重：已签到是幂等成功，不是失败
+      this.creditsAt.set(uid, Date.now())
+      return claimed === 'already'
+        ? { ok: true, status: 'already', message: '今日已签到' }
+        : { ok: true, status: 'ok', message: '签到成功' }
+    } catch (err) {
+      const message = (err as Error).message
+      this.log(`checkin ${uid}: ${message}`)
+      return { ok: false, status: 'error', message }
+    }
+  }
+
+  /** 签到后刷新积分（失败不阻断——积分只供面板显示，不是签到成败的凭据）。 */
+  private async refreshCreditsAfterCheckin(uid: string, a: Auth): Promise<void> {
+    try {
+      this.pool.setCreditsAfterCheckin(uid, await this.client.userEntUsage(a))
+    } catch (err) {
+      this.log(`checkin ${uid}: 积分刷新失败 ${(err as Error).message}`)
+    }
   }
 
   setAlias(alias: string): { ok: boolean; error?: string } {
