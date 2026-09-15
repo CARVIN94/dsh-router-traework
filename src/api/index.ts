@@ -485,6 +485,8 @@ export class TraeworkSupplier implements Supplier {
     try {
       const obj = JSON.parse(body) as Record<string, unknown>
       obj.model = configName
+      // 默认带上 1M 的 max_tokens（未显式指定时）。透传给上游，见 prepareBody 白名单改写。
+      if (typeof obj.max_tokens !== 'number') obj.max_tokens = 1000000
       // 推理等级：上游自己的协议里若认 reasoning_effort 就带上；auto/off 不显式下发
       if (lv !== 'auto' && lv !== '' && lv !== 'none' && lv !== 'off') obj.reasoning_effort = lv
       else if (lv === 'none' || lv === 'off') {
