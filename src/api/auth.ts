@@ -48,6 +48,43 @@ export function needsRefresh(a: Auth, withinMs: number): boolean {
   return Date.now() + withinMs >= a.expiresAt * 1000
 }
 
+/**
+ * 从 JWT accessToken 的 payload 解出签发时间 `iat`（Unix 秒 → ms）。
+ * 解不出来返回 null —— 调用方据此回落到仅按 `expiresAt` 判。
+ * TRAE 的 accessToken payload 形如 `{data:{...},exp,iat}`，iat 在顶层。
+ */
+export function tokenIssuedAtMs(accessToken: string): number | null {
+  const parts = accessToken.split('.')
+  const payload = parts.length >= 2 ? (parts[1] ?? '') : ''
+  if (payload === '') return null
+  let json: string
+  try {
+    json = Buffer.from(payload, 'base64').toString('utf8')
+  } catch {
+    return null
+  }
+  try {
+    const j = JSON.parse(json) as { iat?: number }
+    return typeof j.iat === 'number' && Number.isFinite(j.iat) ? j.iat * 1000 : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 报告 token 签发是否超过 maxIssuedMs（主动轮换上限）。
+ * iat 解不出来 = 不触发（回落到仅临到期判，行为与旧版一致）。
+ *
+ * 为什么需要：TRAE token 有效期 14 天，但上游随时可能服务端吊销旧凭据
+ * （codebuddy 2026-06 批实测：JWT 远未过期仍被 401，refresh 报会话不存在）。
+ * 定期轮换让凭据保持新鲜；对 TRAE 额外的收益是 refreshToken 每窗口轮换，
+ * 轮换链一旦断掉（如长期不用）能尽早发现而不是等到真过期。
+ */
+export function issuedTooLong(accessToken: string, maxIssuedMs: number, now = Date.now()): boolean {
+  const iat = tokenIssuedAtMs(accessToken)
+  return iat !== null && now - iat >= maxIssuedMs
+}
+
 function parseNested(raw: unknown): Omit<Auth, 'filePath'> {
   const n = raw as {
     auth?: Record<string, unknown>

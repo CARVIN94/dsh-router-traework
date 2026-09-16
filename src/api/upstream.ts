@@ -4,7 +4,7 @@
  * 移植自 traework2api/internal/upstream/*（client.go / headers.go / payload.go / solosse.go）。
  */
 import { SOLO, CLIENT_UA } from './constants.ts'
-import { needsRefresh, type Auth } from './auth.ts'
+import { issuedTooLong, needsRefresh, type Auth } from './auth.ts'
 import { randomBytes } from 'node:crypto'
 
 // ---------------------------------------------------------------------------
@@ -41,6 +41,19 @@ const CHECKIN_BUSY_CODE = 9074
 
 /** 9074 重试等待：只等 1s。一次落空就判失败，不再空耗（实测重试几乎必空）。 */
 const CHECKIN_BUSY_RETRY_MS = 1000
+
+/**
+ * 主动刷新上限：accessToken 距**签发**超过这么久就刷新轮换，不等到临到期。
+ *
+ * 为什么需要（对齐 codebuddy 2026-09-16 的修法）：上游可服务端吊销旧凭据
+ * （JWT 远未过期仍 401、refresh 报会话不存在——codebuddy 2026-06 批实测）。
+ * TRAE token 有效期实测 14 天，靠临到期判的签发龄天然 ≤14 天，风险敞口比
+ * codebuddy 的一年期 JWT 小；但 refreshToken 轮换链在长期不用时可能悄悄断掉，
+ * 15 天主动轮换让断链尽早暴露（刷新失败立刻报 session_dead，而不是拖到真过期）。
+ * 取 15 天略大于 14 天有效期 = 每次临到期自然刷新后签发龄归零，本常量主要
+ * 兜「自然刷新没发生」的场景。
+ */
+const REFRESH_MAX_ISSUED_MS = 15 * 24 * 3600_000
 
 /**
  * ide_user_ent_usage 的请求体（2026-09-03 抓包实测）。
@@ -646,9 +659,12 @@ export class SoloClient {
     }
   }
 
-  /** 仅当 token 在 skewMs 内即将过期时才刷新，返回是否真正刷新。 */
+  /**
+   * 触发刷新：临到期（skewMs 内过期）**或**签发超过 REFRESH_MAX_ISSUED_MS
+   * （主动轮换保新鲜，见 auth.ts issuedTooLong 注释）。任一满足即刷。
+   */
   async refreshTokenIfNeeded(a: Auth, skewMs: number): Promise<boolean> {
-    if (!needsRefresh(a, skewMs)) return false
+    if (!needsRefresh(a, skewMs) && !issuedTooLong(a.accessToken, REFRESH_MAX_ISSUED_MS)) return false
     await this.refreshToken(a)
     return true
   }
