@@ -59,6 +59,11 @@ function installFake(script: Script): () => void {
     const u = String(url)
     let body: Record<string, unknown>
     let kind: 'status' | 'claim' | 'usage'
+    // checkinNow 会先按 chatOnce 的同一条路刷 token（闲置号的 accessToken 早就
+    // 过期了，不刷必然 1001）。这里给个可用的新 token，让本文件专注签到语义。
+    if (u.endsWith('/oauth/ExchangeToken')) {
+      return new Response(JSON.stringify({ Result: { Token: 'fresh-at', TokenExpireAt: Date.now() + 86400_000 } }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }
     if (u.endsWith('/checkin_credits/claim')) {
       kind = 'claim'
       body = script.claim[i.claim] ?? { code: 0 }
@@ -218,5 +223,90 @@ test('积分刷新失败不阻断签到成功', async () => {
     assert.equal(r.status, 'already')
   } finally {
     restore()
+  }
+})
+
+/**
+ * 9095 是**该设备**今日已参与签到（NLS 原文），不是「这个账号已领」。
+ *
+ * 2026-10-10 实测复核：本机名额被另一个账号用掉后，当前账号 claim 拿到 9095，
+ * 而该账号当天**没有任何奖励包**。把它当幂等成功（旧的 `claimed === 'already'`
+ * → status 'already'）就是把「没领到」报成「已领到」。
+ */
+test('claim 9095（设备名额已用）且账号未入账 → 报 device_used，不谎报已签到', async () => {
+  const restore = installFake({
+    status: [
+      { code: 0, checked_in: false, did_checked_in: false, enable: true, credits: 200 }, // 前置：账号未签
+      { code: 0, checked_in: false, did_checked_in: true, enable: true, credits: 200 },  // 回查：仍未入账
+    ],
+    claim: [{ code: 9095, message: '当前设备今日已经签到，请明日再来哦～' }],
+    usage: [],
+  })
+  try {
+    const r = await (await makeSupplier()).checkinNow(UID)
+    assert.equal(r.ok, false, '没入账就不能报成功')
+    assert.equal(r.status, 'device_used', '要能区分「设备名额已用」，别混进通用 error')
+    assert.match(r.message ?? '', /设备/, '文案要说明是本机设备名额的问题')
+  } finally {
+    restore()
+  }
+})
+
+test('claim 9095 但回查已入账 → 幂等成功（不因为 code 是 9095 就报失败）', async () => {
+  const restore = installFake({
+    status: [
+      { code: 0, checked_in: false, did_checked_in: false, enable: true, credits: 200 },
+      { code: 0, checked_in: true, did_checked_in: true, enable: true, credits: 200 }, // 已到账
+    ],
+    claim: [{ code: 9095, message: '当前设备今日已经签到' }],
+    usage: [],
+  })
+  try {
+    const r = await (await makeSupplier()).checkinNow(UID)
+    assert.equal(r.ok, true, 'checked_in 才是凭据：到账了就是成功')
+    assert.equal(r.status, 'already')
+  } finally {
+    restore()
+  }
+})
+
+/**
+ * 闲置账号的 accessToken 早就过期了（实测库里三个号全是），签到前必须先刷。
+ * 以前只有 chatOnce 刷 token，checkinNow 不刷 ⇒ 「一直没用过的号点签到」
+ * 必然拿 1001 认证失败——用户看到的却是「签到失败」，看不出该刷 token。
+ */
+test('checkinNow 先刷过期 token 再读状态（闲置号不该报认证失败）', async () => {
+  const { TraeworkSupplier } = await import('./index.ts')
+  const calls: string[] = []
+  const orig = globalThis.fetch
+  globalThis.fetch = (async (url: string) => {
+    const u = String(url)
+    if (u.endsWith('/oauth/ExchangeToken')) {
+      calls.push('refresh')
+      return new Response(JSON.stringify({ Result: { Token: 'fresh-at', TokenExpireAt: Date.now() + 86400_000 } }), { status: 200 })
+    }
+    if (u.endsWith('/checkin_credits/status')) {
+      calls.push('status')
+      return new Response(JSON.stringify({ code: 0, checked_in: true, enable: true, credits: 200 }), { status: 200 })
+    }
+    return new Response(JSON.stringify({ user_entitlement_pack_list: [] }), { status: 200 })
+  }) as typeof fetch
+  const creds = fakeCreds()
+  // expiresAt 已过期 → needsRefresh 必然为真
+  creds.save('traework', 'u1', {
+    auth: { accessToken: 'at', refreshToken: 'rt', expiresAt: 1, domain: 'trae.cn', apiHost: '', machineId: 'm1', deviceId: '1711320556112436' },
+    account: { uid: 'u1', enterpriseId: '', nickname: 'u1' },
+  })
+  try {
+    const sup = new TraeworkSupplier({ stateFile: '' }, fakeStore(), creds, () => {})
+    await sup.start()
+    calls.length = 0 // 忽略 start 期间的调用，只看 checkinNow
+    const r = await sup.checkinNow(UID)
+    assert.equal(calls[0], 'refresh', '签到前必须先刷 token，否则闲置号必报 1001')
+    assert.ok(calls.includes('status'), '刷完要真的去读签到状态')
+    assert.equal(r.ok, true)
+    sup.dispose()
+  } finally {
+    globalThis.fetch = orig
   }
 })

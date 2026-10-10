@@ -21,8 +21,22 @@ export type ErrKind =
   | 'client' // 其他 4xx
   | 'checkin_denied' // 签到专属：上游拒绝发放（9074），与限流无关
 
-/** 签到业务码：今日已签到（幂等，按成功处理）。 */
-const CHECKIN_ALREADY_CODE = 9095
+/**
+ * 签到业务码 9095。
+ *
+ * 上游 `ug` 族的 NLS 文案是「该设备今日已参与签到」，口径指向**设备**
+ * （`x-device-id` 的值）而不是账号。所以它**不能**当「今日已签到 / 幂等成功」：
+ * 若它确实按设备判，那么本机名额被另一个账号用掉后，当前账号 claim 会拿到它，
+ * 而该账号当天没有任何奖励包——报 already 就把「没领到」说成了「已领到」。
+ *
+ * **本机未复现**（2026-10-10 实测：已领账号 `checked_in=true` 再 claim 一律回
+ * `code 0`，与 deviceId 无关——账号级幂等先行；造不出「账号未领 + 设备名额已用」
+ * 那一态）。因此这里只做**防御式**处理，不放宽判定凭据：
+ * claim 后始终回查 `checked_in`，只有它说了算；回查为 false 且 code 是 9095 时
+ * 报 device_used 而不是 already。这样即使 9095 的真实语义与文案不符，
+ * 最坏也只是把一次失败归类得更具体，不会谎报成功。
+ */
+const CHECKIN_DEVICE_USED_CODE = 9095
 
 /**
  * 签到业务码：「当前参与用户太多」。
@@ -75,10 +89,52 @@ function hasExpired(endTime: number | undefined, nowSec: number): boolean {
 const CUSTOM_MODEL_PREFIX = 'custom_model_'
 
 /**
- * 实测不产出对话内容的内部模型（2026-09-03 逐个打真实上游验证）。
- * 只加**确认不可用**的：这个表多留一个只是面板多一行，误删一个就是断模型。
+ * 内部调度模型：不产出对话内容，发出去只能拿到空响应（2026-09-03 逐个实测：
+ * browser_use_subagent 全程零 output 帧、completion_tokens=0）。
+ *
+ * **不能**用上游的 is_invisible_to_user 当过滤条件——实测它把 glm-5 /
+ * glm-5-turbo / seed-code-pro-0430 / Doubao-Seed-2.0-Code 也标成 true，
+ * 而这四个都能正常对话，照它过滤会静默砍掉 4 个可用模型。
  */
 const NON_CHAT_MODELS = new Set(['browser_use_subagent'])
+
+/**
+ * 一行详细表条目能否进 roster（远端名录的 join 目标）。
+ *
+ * 自定义模型（用户在 TRAE 云端挂的第三方代理，base_url 指向别处）不属于本
+ * 供应商配额，发过去就在流里报 4023——前缀兜底不能省：2026-09-03 实测上游对
+ * 11 个 `custom_model_*` 全部返回 is_custom_model=false，只认标志等于没过滤。
+ */
+function isRosterCandidate(id: string, isCustom: boolean | undefined): boolean {
+  if (isCustom === true) return false
+  if (id.startsWith(CUSTOM_MODEL_PREFIX)) return false
+  return !NON_CHAT_MODELS.has(id)
+}
+
+/** 正数才采纳（0 / undefined / NaN 都当作「上游没给」）。 */
+function positiveNumber(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0
+}
+
+/** 显示名归一化，用于 config_name 与远端名录的跨源 join。 */
+function displayKey(name: string): string {
+  return name.trim().toLowerCase()
+}
+
+/** 上游模型表的一行：config_name + 归属 function + 窗口。 */
+export interface SoloModelEntry {
+  id: string
+  name: string
+  /**
+   * 列出该 config_name 的 function——**chat 必须回放它**，发错时上游 HTTP 200
+   * 但流内 `code=4001`（2026-10-10 实测 7 个模型如此）。
+   */
+  function: string
+  /** 上下文窗口（token），来自上游；拿不到为 0。 */
+  contextWindow: number
+  /** 单次最大输出（token），拿不到为 0。 */
+  maxTokens: number
+}
 
 export class UpstreamError extends Error {
   kind: ErrKind
@@ -217,8 +273,15 @@ export function oauthHeaders(): Record<string, string> {
 // payload.go — OpenAI → SOLO llm_utils_chat 请求体改写
 // ---------------------------------------------------------------------------
 
-/** OpenAI → SOLO 单 pass 改写；无法解析时原样返回。 */
-export function prepareBody(src: string): string {
+/**
+ * OpenAI → SOLO 单 pass 改写；无法解析时原样返回。
+ *
+ * `functionName` 是**模型自己的归属 function**（来自 get_detail_param 的查询
+ * 来源，见 fetchModels）。上游把可调用名录按 function 拆开，一个模型只有用
+ * 列出它的那个 function 才调得动——发错时 HTTP 200 但流内 `code=4001`。
+ * 不传则用历史默认值。
+ */
+export function prepareBody(src: string, functionName: string = SOLO.Function): string {
   if (src === '') return src
   let obj: Record<string, unknown>
   try {
@@ -227,7 +290,7 @@ export function prepareBody(src: string): string {
     return src
   }
   obj.stream = true
-  obj.function = SOLO.Function
+  obj.function = functionName
 
   const msgs = obj.messages
   if (Array.isArray(msgs)) {
@@ -576,6 +639,8 @@ export interface SoloClientOptions {
   agentHost?: string
   ugHost?: string
   oauthHost?: string
+  /** 远端模型目录 host（只读名录；测试注入）。 */
+  remoteHost?: string
   timeoutSeconds?: number
   /** fetch 实现（默认全局 fetch；测试注入）。 */
   fetchImpl?: typeof fetch
@@ -590,6 +655,7 @@ export class SoloClient {
   private agentHost: string
   private ugHost: string
   private oauthHost: string
+  private remoteHost: string
   private timeoutSeconds: number
   private fetchImpl: typeof fetch
   private checkinRetryDelayMs: number
@@ -599,6 +665,7 @@ export class SoloClient {
     this.agentHost = opts.agentHost ?? SOLO.AgentHost
     this.ugHost = opts.ugHost ?? SOLO.UgHost
     this.oauthHost = opts.oauthHost ?? SOLO.OAuthHost
+    this.remoteHost = opts.remoteHost ?? SOLO.RemoteHost
     this.timeoutSeconds = opts.timeoutSeconds ?? 120
     this.fetchImpl = opts.fetchImpl ?? globalThis.fetch.bind(globalThis)
     this.checkinRetryDelayMs = opts.checkinRetryDelayMs ?? CHECKIN_BUSY_RETRY_MS
@@ -672,8 +739,12 @@ export class SoloClient {
   /**
    * 发 llm_utils_chat 请求并返回原始 SSE body 流（调用方负责 Close）。
    * 非 2xx 时 body 为 null、返回上游状态与响应体；只有传输层失败才抛错。
+   *
+   * `functionName` 必须是**该模型自己的归属 function**（见 fetchModels）：
+   * 发错时上游 HTTP 200 但流内 `code=4001`，看起来像「参数无效」而实际是
+   * 「这个 function 不服务这个模型」。
    */
-  async chatStream(a: Auth, body: string): Promise<{
+  async chatStream(a: Auth, body: string, functionName?: string): Promise<{
     body: ReadableStream<Uint8Array> | null
     status: number
     respBody: string
@@ -683,7 +754,7 @@ export class SoloClient {
       resp = await this.fetchImpl(this.agentHost + SOLO.EpChat, {
         method: 'POST',
         headers: soloHeaders(a, true),
-        body: prepareBody(body),
+        body: prepareBody(body, functionName),
       })
     } catch (error) {
       throw new Error(`transport: ${(error as Error).message}`)
@@ -696,63 +767,187 @@ export class SoloClient {
   }
 
   /** 动态模型信息。 */
-  async fetchModels(a: Auth): Promise<Array<{ id: string; name: string; contextWindow: number; maxTokens: number }>> {
-    const data = await this.doJSON(
-      this.agentHost + SOLO.EpModels,
-      soloHeaders(a, false),
-      {
-        function: SOLO.Function,
+  async fetchModels(a: Auth): Promise<SoloModelEntry[]> {
+    // 两件事并行：远端名录（用户可见的骨架）+ 各 function 的详细表（给 config_name
+    // 补归属 function 与窗口）。两者是不同 host，并行取总耗时 ≈ max(两者)。
+    const [remote, perFunction] = await Promise.all([
+      this.remoteModels(a),
+      Promise.all(SOLO.DirectoryFunctions.map((fn) => this.detailModels(a, fn))),
+    ])
+
+    // 归属表：按 DirectoryFunctions 顺序**先命中者拥有**该 config_name。
+    // 顺序即优先级——不是随手排的，见 constants.ts 的 DirectoryFunctions 注释。
+    const wire = new Map<string, { fn: string; contextWindow: number; maxTokens: number; name: string }>()
+    const wireByName = new Map<string, string>()
+    for (const { fn, list } of perFunction) {
+      for (const cfg of list) {
+        const c = cfg as {
+          config_name?: string
+          context_window_tokens?: { dev?: number }
+          model_detail_list?: Array<{ max_tokens?: number }>
+          display_config?: { display_name?: string; is_custom_model?: boolean }
+        }
+        const id = c.config_name
+        if (id === undefined || id === '' || !isRosterCandidate(id, c.display_config?.is_custom_model)) continue
+        if (wire.has(id)) continue
+        const dev = positiveNumber(c.context_window_tokens?.dev)
+        const maxTokens = positiveNumber(c.model_detail_list?.[0]?.max_tokens)
+        wire.set(id, { fn, contextWindow: dev, maxTokens, name: c.display_config?.display_name ?? '' })
+        const key = displayKey(c.display_config?.display_name ?? '')
+        if (key !== '' && !wireByName.has(key)) wireByName.set(key, id)
+      }
+    }
+
+    const out: SoloModelEntry[] = []
+    const seen = new Set<string>()
+    const push = (e: SoloModelEntry): void => {
+      if (seen.has(e.id)) return
+      seen.add(e.id)
+      out.push(e)
+    }
+    if (remote.length > 0) {
+      // 远端的每一行都是厂商愿意给用户看的模型（Trae IDE 的模型选择器读它），
+      // 作为骨架：顺序按厂商的，窗口用它给的 dev。
+      for (const m of remote) {
+        const id = wire.has(m.id) ? m.id : wireByName.get(displayKey(m.displayName))
+        if (id === undefined) continue
+        const w = wire.get(id)
+        if (w === undefined) continue
+        push({
+          id,
+          name: m.displayName !== '' ? m.displayName : w.name,
+          function: w.fn,
+          contextWindow: m.contextWindow > 0 ? m.contextWindow : w.contextWindow,
+          maxTokens: w.maxTokens,
+        })
+      }
+      // **再并上主 function 那一家独有的行**（即本插件改动前的 roster）。
+      // 为什么不只发远端名录：那种做法会**静默删掉**今天还能用的模型
+      // （2026-10-10 实测 `glm-5-turbo` / `seed-code-pro-0430` / `aquila` /
+      // `sagitta` / `summary` / `explore_sub_agent_v2` 都真能出内容，但不在
+      // 远端名录里）。从用户的模型选择器里拿掉能用的东西不是优化，所以这里
+      // 只做**纯增量**：远端给什么就给什么，主 function 原有的一个不少。
+      // 其它 function 独有的内部件（title_generation / fast_apply / *-auto …）
+      // 仍然不进——它们不在远端名录、也不在主 function 表里。
+      // 天花板：若哪天想严格对齐 IDE 名录，把这一段删掉即可（一行级改动）。
+      for (const [id, w] of wire) {
+        if (w.fn !== SOLO.Function) continue
+        push({ id, name: w.name, function: w.fn, contextWindow: w.contextWindow, maxTokens: w.maxTokens })
+      }
+    } else {
+      // 远端名录拿不到时退回**主 function 一家的表**（即本插件的历史行为），
+      // 而不是把详细表并集原样端出去——并集里有一半是其它 function 独有的
+      // 内部件（-auto 变体、title_generation、fast_apply…），宁可少列也不把
+      // 垃圾灌进模型选择器。
+      for (const [id, w] of wire) {
+        if (w.fn !== SOLO.Function) continue
+        push({ id, name: w.name, function: w.fn, contextWindow: w.contextWindow, maxTokens: w.maxTokens })
+      }
+    }
+    if (out.length === 0) throw new Error('models api returned empty list')
+    return out
+  }
+
+  /** 一个 function 的详细表；单独失败不影响其它 function。 */
+  private async detailModels(a: Auth, fn: string): Promise<{ fn: string; list: unknown[] }> {
+    try {
+      const data = await this.doJSON(this.agentHost + SOLO.EpModels, soloHeaders(a, false), {
+        function: fn,
         config_names: null,
         need_prompt: false,
         current_config_info: null,
         poly_prompt: true,
         mode_type: null,
         agent_type: null,
-      },
-    )
-    const list = (data as { config_info_list?: unknown[] })?.config_info_list ?? []
-    const out: Array<{ id: string; name: string; contextWindow: number; maxTokens: number }> = []
-    for (const cfg of list) {
-      const c = cfg as { config_name?: string; display_config?: { display_name?: string; is_custom_model?: boolean } }
-      if (!c.config_name) continue
-      // 过滤用户/其他工具在 TRAE 云端添加的自定义模型（base_url 指向别处，不属于本供应商）。
-      // 前缀兜底**不能省**：2026-09-03 实测上游对 11 个 custom_model_* 全部返回
-      // is_custom_model=false，只认这个标志等于没过滤——面板会混进一批发过去
-      // 就在流里报 4023 的模型（与 wild-work 的做法一致）。
-      if (c.display_config?.is_custom_model === true) continue
-      if (c.config_name.startsWith(CUSTOM_MODEL_PREFIX)) continue
-      // 内部调度模型：不产出对话内容，发出去只能拿到空响应（2026-09-03 逐个
-      // 实测：browser_use_subagent 全程零 output 帧、completion_tokens=0）。
-      //
-      // **不能**用上游的 is_invisible_to_user 当过滤条件——实测它把 glm-5 /
-      // glm-5-turbo / seed-code-pro-0430 / Doubao-Seed-2.0-Code 也标成 true，
-      // 而这四个都能正常对话，照它过滤会静默砍掉 4 个可用模型。同理，
-      // file_search_agent / explore_sub_agent_v2 / summary 虽然看着像内部件，
-      // 实测都能正常出内容，一并保留。
-      // 所以这里只列**实测确认不可用**的，宁可多留一个也不误杀。
-      if (NON_CHAT_MODELS.has(c.config_name)) continue
-      out.push({ id: c.config_name, name: c.display_config?.display_name ?? '', contextWindow: 0, maxTokens: 0 })
+      })
+      const list = (data as { config_info_list?: unknown[] })?.config_info_list
+      return { fn, list: Array.isArray(list) ? list : [] }
+    } catch {
+      return { fn, list: [] }
     }
-    if (out.length === 0) throw new Error('models api returned empty list')
-    return out
   }
 
-  /** 查询签到状态。业务 code 非 0 也报错——上游一律 200，成败只在 code 里。 */
-  async checkinStatus(a: Auth): Promise<{ checkedIn: boolean; credits: number; enable: boolean }> {
+  /**
+   * 远端模型目录（按 function 分组，同一模型会在多组重复）。**只读**，
+   * 失败返回空数组由调用方回退——它不是本插件的主链路。
+   */
+  private async remoteModels(a: Auth): Promise<Array<{ id: string; displayName: string; contextWindow: number }>> {
+    try {
+      const url = `${this.remoteHost}${SOLO.EpRemoteModels}?functions=${encodeURIComponent(SOLO.DirectoryFunctions.join(','))}`
+      const resp = await this.fetchImpl(url, {
+        headers: {
+          Authorization: `Cloud-IDE-JWT ${a.accessToken}`,
+          'Content-Type': 'application/json',
+          'x-trae-client-type': 'web',
+          'x-trae-user-timezone': 'Asia/Shanghai',
+          'x-preferenced-language': 'zh-cn',
+          Referer: `${SOLO.RemoteHost}/`,
+          'User-Agent': 'Mozilla/5.0',
+        },
+        signal: AbortSignal.timeout(this.timeoutSeconds * 1000),
+      })
+      if (!resp.ok) return []
+      const json = (await resp.json()) as { data?: { list?: Array<{ models?: unknown[] }> } }
+      // 同一模型出现在多个组里，各组的窗口可能不一致 ⇒ 取**最大**的，
+      // 让同一个模型在面板上的窗口不随上游分组顺序变化（顺序实测不稳定）。
+      const byId = new Map<string, { id: string; displayName: string; contextWindow: number }>()
+      for (const group of json.data?.list ?? []) {
+        for (const raw of group.models ?? []) {
+          const m = raw as { name?: string; display_name?: string; context_window_tokens?: { dev?: number } }
+          const id = m.name
+          if (id === undefined || id === '') continue
+          const dev = positiveNumber(m.context_window_tokens?.dev)
+          const prev = byId.get(id)
+          byId.set(id, {
+            id,
+            displayName: m.display_name ?? prev?.displayName ?? '',
+            contextWindow: Math.max(dev, prev?.contextWindow ?? 0),
+          })
+        }
+      }
+      return [...byId.values()]
+    } catch {
+      return []
+    }
+  }
+
+  /**
+   * 查询签到状态。业务 code 非 0 也报错——上游一律 200，成败只在 code 里。
+   *
+   * 两个布尔字段的**判定维度不同**（2026-10-10 实测复核，此前 README 记反了）：
+   *  - `checked_in` 按**账号**：该账号今天的签到奖励包已到账。换 deviceId 读数不变。
+   *  - `did_checked_in` 按**设备**（就是 `x-device-id` 这个头的值）：这台机器今天
+   *    的名额已用掉，**不区分是哪个账号用的**。同一账号带本机真实号读是 true、
+   *    带另一个号读是 false，重复读不会自己变 true（只有真 claim 才置位）。
+   *
+   * 两者组合出的关键一态：`!checked_in && did_checked_in` = 本机名额已用、而
+   * 这个账号今天什么都没领到——此时 claim 被拒（本机未复现其 code，见
+   * CHECKIN_DEVICE_USED_CODE）。判定成败始终只认 checked_in。
+   */
+  async checkinStatus(a: Auth): Promise<{ checkedIn: boolean; didCheckedIn: boolean; credits: number; enable: boolean }> {
     const data = await this.doJSON(this.ugHost + SOLO.EpCheckinStatus, ugHeaders(a), {})
-    const r = data as { checked_in?: boolean; credits?: number; enable?: boolean; code?: number; message?: string; msg?: string }
+    const r = data as { checked_in?: boolean; did_checked_in?: boolean; credits?: number; enable?: boolean; code?: number; message?: string; msg?: string }
     const code = Number(r.code ?? 0)
     // 1001 = 认证失败（实测：无效 token → code 1001 + enable false）
     if (code !== 0) throw new UpstreamError(code === 1001 ? 'session_dead' : 'soft_rate', 200, `${r.message ?? r.msg ?? 'checkin status failed'} (code=${code})`)
-    return { checkedIn: !!r.checked_in, credits: Number(r.credits ?? 0), enable: !!r.enable }
+    return {
+      checkedIn: !!r.checked_in,
+      didCheckedIn: !!r.did_checked_in,
+      credits: Number(r.credits ?? 0),
+      enable: !!r.enable,
+    }
   }
 
   /** 执行签到。成功与否看**业务 code**而非 HTTP 状态：上游一律 200，
    *  失败藏在 code 里。只看 HTTP 会误报成功——积分没变，用户却看到「签到成功」。
    *
-   *  业务码（2026-08-31 实测）：
+   *  业务码（2026-08-31 实测；9095 见 CHECKIN_DEVICE_USED_CODE 的证据分级）：
    *  - 0    = 成功
-   *  - 9095 = 今日已签到 → 幂等成功（不是失败）
+   *  - 9095 = 上游文案是「该设备今日已参与签到」，口径指向**设备**。按防御式
+   *           处理返回 'device_used'，**不当**幂等成功：若它确实按设备判，本机
+   *           名额被别的账号用掉时当前账号就会拿到它，而该账号当天没有奖励包。
+   *           报 already 会把「没领到」说成「已领到」——这是这里唯一不能犯的错。
+   *           调用方仍以回查 `checked_in` 为唯一凭据（见 checkinNow）。
    *  - 9074 = 「参与用户太多」→ **账号级稳定拒绝，不是抖动**（2026-09-02 订正，
    *           见 CHECKIN_BUSY_CODE 注释：40 余次重试全失败、换 deviceId/token 无效）。
    *           保留一次快速重试（默认 1s）只兜「上游万一恢复成真抖动」，落空即判失败，
@@ -760,16 +955,14 @@ export class SoloClient {
    *  - 9090 = 活动暂不可用（另一套 activity/action 体系，本插件不走）
    *  - 1001 = token/会话失效（与 chat 的 401 同义）→ session_dead
    *
-   *  判重维度是**账号**不是设备（实测：换新 deviceId 后 checked_in 仍为 true），
-   *  所以「已签到」是幂等成功。deviceId 依然要稳定——它参与上游风控画像，
-   *  但**不必**为了绕过 9074 去换 id。 */
-  async checkinClaim(a: Auth): Promise<'ok' | 'already'> {
+   *  deviceId 依然要稳定——它参与上游风控画像，但**不必**为了绕过 9074 去换 id。 */
+  async checkinClaim(a: Auth): Promise<'ok' | 'device_used'> {
     for (let attempt = 0; ; attempt++) {
       const data = await this.doJSON(this.ugHost + SOLO.EpCheckinClaim, ugHeaders(a), {})
       const r = data as { code?: number; message?: string; msg?: string }
       const code = Number(r.code ?? 0)
       if (code === 0) return 'ok'
-      if (code === CHECKIN_ALREADY_CODE) return 'already'
+      if (code === CHECKIN_DEVICE_USED_CODE) return 'device_used'
       const msg = `${r.message ?? r.msg ?? 'checkin failed'} (code=${code})`
       if (code === CHECKIN_BUSY_CODE && attempt === 0) {
         await this.sleepImpl(this.checkinRetryDelayMs)

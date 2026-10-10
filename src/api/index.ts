@@ -95,6 +95,10 @@ export class TraeworkSupplier implements Supplier {
   private credentials: CredentialStoreLike
   private log: (msg: string) => void
   private modelsCache: ModelInfo[] | undefined
+  /** 模型 id → 归属 function（只记非默认的；见 refreshFromUpstream）。 */
+  private modelFunctions = new Map<string, string>()
+  /** 进行中的凭证刷新（uid → promise）：避免并发轮换 refreshToken 互相覆盖。 */
+  private refreshing = new Map<string, Promise<Auth>>()
   /** 上次 chatOnce 失败原因（供核心测试模型汇总诊断）。 */
   private pendingLogin: { machineId: string; deviceId: string } | undefined
   /**
@@ -209,14 +213,43 @@ export class TraeworkSupplier implements Supplier {
       const a = this.pool.authByUID(st.uid)
       if (!a) continue
       this.creditsAt.set(st.uid, now) // 先占位，避免同一轮重复发请求
-      this.client.userEntUsage(a).then(
-        (remain) => {
-          this.pool.setCredits(st.uid, remain)
-          this.creditsAt.set(st.uid, Date.now())
-        },
-        () => this.creditsAt.delete(st.uid), // 失败：下次 status() 再试
-      )
+      void this.freshAuth(a)
+        .then(() => this.client.userEntUsage(a))
+        .then(
+          (remain) => {
+            this.pool.setCredits(st.uid, remain)
+            this.creditsAt.set(st.uid, Date.now())
+          },
+          () => this.creditsAt.delete(st.uid), // 失败：下次 status() 再试
+        )
     }
+  }
+
+  /**
+   * 确保凭证可用：临到期/已过期就先刷一次（与 chatOnce 同一条路），刷到就落盘。
+   *
+   * **所有不经过 chatOnce 的上游调用都必须先过这里**（获取模型、拉积分、签到）：
+   * 闲置账号的 accessToken 早就过期了（实测本机三个号全是），拿旧 token 打上游
+   * 只会拿到 401/1001，而调用点各自把错吞成「空结果」——表现就是「获取模型点了
+   * 没反应 / 积分一直是未知」，看不出是 token 的锅。
+   *
+   * 同一账号并发刷新会去重：refreshToken 是**轮换**的，两个并发刷新各自拿一份
+   * 新 token 再互相覆盖，可能把轮换链写坏（上游吊销后才要重新登录，属于真损失）。
+   */
+  private freshAuth(a: Auth): Promise<Auth> {
+    const inflight = this.refreshing.get(a.uid)
+    if (inflight !== undefined) return inflight
+    const p = this.client
+      .refreshTokenIfNeeded(a, this.cfg.refreshSkewMs)
+      .then((refreshed) => {
+        // 只在真刷过时落盘：没刷还写一次，启动/每次拉取都白写一遍凭证，
+        // 也让「哪里写了盘」这件事变得不可读。
+        if (refreshed) this.saveAuth(a)
+        return a
+      })
+      .finally(() => this.refreshing.delete(a.uid))
+    this.refreshing.set(a.uid, p)
+    return p
   }
 
   // -------------------------------------------------------------------------
@@ -251,20 +284,37 @@ export class TraeworkSupplier implements Supplier {
     const acct = this.pool.authByUID(this.pool.list()[0]?.uid ?? '')
     if (!acct) return
     try {
+      // 先保证 token 可用：闲置号的 accessToken 早过期，直接拉会静默拿到空表
+      // （catch 吞掉），表现为「获取模型点了没反应」。
+      await this.freshAuth(acct)
       const models = await this.client.fetchModels(acct)
       const fetched: ModelInfo[] = []
+      // 模型 → 归属 function：chat 时必须回放它（发错时上游 HTTP 200 但流内
+      // `code=4001`）。只记非默认 function，默认值保持不写、走 SOLO.Function。
+      const byFunction = new Map<string, string>()
       for (const m of models) {
         if (m.id === '') continue
         const entry: ModelInfo = { id: m.id }
+        // 契约单位是 **K**（核心 comboContextWindow 换算回 token，见
+        // dsh-router docs/suppliers.md「模型统一策略」）。以前这里恒为 0——
+        // 上游明明给了 context_window_tokens，我们没读，于是核心拿不到窗口、
+        // 自动压缩一直跳过（DSH 侧表现为「永远不压缩」）。
         if (m.contextWindow > 0) entry.context_length = Math.round(m.contextWindow / 1000)
         fetched.push(entry)
+        if (m.function !== '' && m.function !== SOLO.Function) byFunction.set(m.id, m.function)
       }
       if (fetched.length > 0) {
         this.modelsCache = fetched
+        this.modelFunctions = byFunction
       }
     } catch {
       // 拉取失败回退缓存/空
     }
+  }
+
+  /** 该模型应发往的 function（上游按 function 拆名录；未知则用默认）。 */
+  private functionFor(configName: string): string {
+    return this.modelFunctions.get(configName) ?? SOLO.Function
   }
 
   /** 用户手动添加的模型 id（supplier-config custom）。 */
@@ -303,13 +353,25 @@ export class TraeworkSupplier implements Supplier {
    *
    *  为什么必须回查：积分（user_ent_usage）是**所有包**的聚合剩余额度，
    *  实测某账号签到前后都是同一个数——拿它判成败会谎报「签到成功」。
-   *  只有 status.checked_in 是这次签到的真凭据。 */
-  async checkinNow(uid: string): Promise<{ ok: boolean; status: 'ok' | 'already' | 'disabled' | 'error'; message?: string }> {
+   *  只有 status.checked_in 是这次签到的真凭据。
+   *
+   *  两个字段判定维度不同（2026-10-10 实测复核）：
+   *    checked_in     按**账号**——该账号今天的奖励包已到账
+   *    did_checked_in 按**设备**——本机今天的名额已用，不区分哪个账号用的
+   *  （实测证据：同一账号带本机真实设备号读 did_checked_in=true、带另一个号读
+   *  false；checked_in 只随账号变。旧 README 把两者记反了。）
+   *
+   *  `!checkedIn && didCheckedIn` = 本机名额被（另一个账号）用掉，而这个账号
+   *  一分没领到。此时 claim 必被拒，如实报 device_used，**不能**报「今日已签到」。 */
+  async checkinNow(uid: string): Promise<{ ok: boolean; status: 'ok' | 'already' | 'disabled' | 'device_used' | 'error'; message?: string }> {
     const st = this.pool.list().find((s) => s.uid === uid)
     if (st === undefined) return { ok: false, status: 'error', message: '链接不存在' }
     const a = this.pool.authByUID(uid)
     if (!a || a.refreshToken === '') return { ok: false, status: 'error', message: '凭证缺失' }
     try {
+      // 闲置账号的 accessToken 早就过期了，先刷再打上游（与 chatOnce 同一条路）。
+      // 以前只有 chatOnce 刷，于是「一直没用过的号点签到 / 拉积分」必然失败。
+      await this.freshAuth(a)
       const status = await this.client.checkinStatus(a)
       if (status.checkedIn) {
         await this.refreshCreditsAfterCheckin(uid, a)
@@ -325,14 +387,23 @@ export class TraeworkSupplier implements Supplier {
       // 回查：claim 返回 0 也不代表真签上了，checked_in 才是凭据
       const after = await this.client.checkinStatus(a)
       await this.refreshCreditsAfterCheckin(uid, a)
-      if (!after.checkedIn) {
-        return { ok: false, status: 'error', message: '签到未生效：上游未标记已签到' }
+      if (after.checkedIn) {
+        // 账号今天的奖励包已到账：claim=ok 是这次领到的，否则是本来就有（幂等）
+        this.creditsAt.set(uid, Date.now())
+        return claimed === 'ok'
+          ? { ok: true, status: 'ok', message: '签到成功' }
+          : { ok: true, status: 'already', message: '今日已签到' }
       }
-      // 上游按账号判重：已签到是幂等成功，不是失败
-      this.creditsAt.set(uid, Date.now())
-      return claimed === 'already'
-        ? { ok: true, status: 'already', message: '今日已签到' }
-        : { ok: true, status: 'ok', message: '签到成功' }
+      // 没入账。9095 = **该设备**今日已参与签到（不是「这个账号已领」）：本机
+      // 名额被用掉时当前账号就是这个下场——如实报原因，别谎报成幂等成功。
+      if (claimed === 'device_used') {
+        return {
+          ok: false,
+          status: 'device_used',
+          message: '本机设备今日的签到名额已被用掉（通常是本机另一个账号先领了），该账号今天领不到',
+        }
+      }
+      return { ok: false, status: 'error', message: '签到未生效：上游未标记已签到' }
     } catch (err) {
       const message = (err as Error).message
       this.log(`checkin ${uid}: ${message}`)
@@ -506,8 +577,7 @@ export class TraeworkSupplier implements Supplier {
 
     // token 临近过期 → 先 refresh（过期=这个号现在不可用，核心会按 session_dead 处理）
     try {
-      const refreshed = await this.client.refreshTokenIfNeeded(acct, this.cfg.refreshSkewMs)
-      if (refreshed) this.saveAuth(acct)
+      await this.freshAuth(acct)
     } catch (err) {
       const ue = err as { kind?: string }
       return { ok: false, state: ue.kind === 'session_dead' ? 'session_dead' : 'transport', message: `refresh: ${(err as Error).message}` }
@@ -515,7 +585,10 @@ export class TraeworkSupplier implements Supplier {
 
     let streamRes: { body: ReadableStream<Uint8Array> | null; status: number; respBody: string }
     try {
-      streamRes = await this.client.chatStream(acct, body)
+      // 回放该模型自己的归属 function：上游把名录按 function 拆开，发错时
+      // HTTP 200 但流内 code=4001（看起来像「参数无效」，实际是「这个 function
+      // 不服务这个模型」）。未知名回落默认 function。
+      streamRes = await this.client.chatStream(acct, body, this.functionFor(configName))
     } catch (err) {
       const msg = (err as Error).message
       return { ok: false, state: 'transport', message: msg }

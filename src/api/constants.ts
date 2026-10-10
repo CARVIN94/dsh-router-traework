@@ -21,7 +21,37 @@ export const SOLO = {
   IdeVersionCode: '20260820',
   DeviceBrand: '83DG',
   OSVersion: 'Windows 11 Pro',
+  /** 默认 function：拿不到模型自己的归属时用它（也是历史行为，保持不变）。 */
   Function: 'solo_work_lite',
+  /**
+   * 查模型表时要问的 function 列表，**顺序 = 归属优先级**（先命中的 function
+   * 拥有该 config_name，chat 时按它回放）。
+   *
+   * 上游把可调用名录**按 function 拆开**（SOLO 各模式各一张表），而一个模型
+   * 只有用**列出它的那个 function** 才调得动：2026-10-10 实测，只发
+   * `solo_work_lite` 时 `glm-5.1` / `qwen-3.5` / `kimi-k2.5` / `minimax-m2.7` /
+   * `qwen-3.6-plus` / `glm-5v-turbo` / `Doubao-Seed-Code` 全部 HTTP 200 但流内
+   * `code=4001`（参数无效），换成各自归属的 function 立刻正常出内容。
+   *
+   * 现行 Function 排第一：它已经验证可用，放首位让既有模型的归属不发生变动。
+   */
+  DirectoryFunctions: [
+    'solo_work_lite',
+    'solo_work_remote',
+    'solo_agent_remote',
+    'chat_v3',
+    'solo_coder',
+    'builder_v3',
+  ],
+  /**
+   * 远端模型目录（Trae IDE 模型选择器读的就是它）：按 function 分组返回
+   * **厂商自己给用户看的**名录。实测 2026-10-10：它 32 个模型与「详细表并集」
+   * 的交集正是这 32 个，而详细表并集另有 32 个内部件
+   * （title_generation / fast_apply / search_agent_* / *-auto …）不对用户展示。
+   * 所以以它为**骨架**、详细表只用来补 config_name / function / 窗口。
+   */
+  RemoteHost: 'https://solo.trae.cn',
+  EpRemoteModels: '/api/remote/v1/models',
   /**
    * 签到/积分（api.trae.cn）走的是 **VSCode 插件进程**，UA 与 IDE 主进程的
    * `Trae/0.1.61`(CLIENT_UA)、`TraeClient/TTNet` 都不同（2026-09-03 抓包实测）。

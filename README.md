@@ -53,22 +53,66 @@ dsh plugin --profile web add dsh-router-traework
   缓存预热，拿不到时报 `-1`（不是 0），核心保留上次持久化的值
 
 **本插件不做自动调度**：不挂后台定时器。签到是核心在用户点「签到」时逐个
-链接触发的（`POST /suppliers/:id/checkin` → `checkinNow(uid)`），token 刷新走
-`chatOnce` 触发式路径。曾移植自 traework2api 的每日自动签到 `Scheduler` 已删除
-（核心没有定时入口，放着是死代码）。
+链接触发的（`POST /suppliers/:id/checkin` → `checkinNow(uid)`）。曾移植自
+traework2api 的每日自动签到 `Scheduler` 已删除（核心没有定时入口，放着是死代码）。
+
+**token 刷新是共享前置**：所有打上游的路（`chatOnce` / 获取模型 / 拉积分 /
+签到）都先过一个 `freshAuth`，临到期或已过期就刷一次并落盘。闲置账号的
+accessToken 早就过期了（实测本机三个号全是），哪条路少这一步，那条路就会
+静默失效——「获取模型点了没反应」「积分一直是未知」「一直没用过的号签到必
+失败」都是这么来的。同一账号的并发刷新会去重：refreshToken 是**轮换**的，
+两个并发刷新互相覆盖可能写坏轮换链。
 
 完整契约见 [dsh-router 的 `docs/suppliers.md`](https://github.com/CARVIN94/dsh-router/blob/main/docs/suppliers.md)。
+
+## 获取模型
+
+模型名录取自上游两处，**合并后是纯增量**（不会从用户手里拿走今天还能用的模型）：
+
+1. **远端名录**（`solo.trae.cn/api/remote/v1/models`，按 function 分组）——
+   厂商给 Trae IDE 模型选择器看的那一份，作为骨架与展示名/窗口来源
+2. **详细表**（`get_detail_param`，逐 function 查询）——给出每个 config_name
+   **归属于哪个 function**、以及 `max_tokens`
+
+要点：
+
+- **归属 function 必须回放**：上游把可调用名录按 function 拆开，一个模型只有用
+  **列出它的那个 function** 才调得动。发错时上游 **HTTP 200 但流内 `code=4001`**
+  （「参数无效」），看起来像请求写错了。2026-10-10 实测：只发 `solo_work_lite`
+  时 `glm-5.1` / `qwen-3.5` / `kimi-k2.5` / `minimax-m2.7` / `qwen-3.6-plus` /
+  `glm-5v-turbo` / `Doubao-Seed-Code` 全部 4001，换成各自归属的 function 后
+  全部正常应答。插件把「模型 → function」记下来，chat 时回放（见
+  `DirectoryFunctions` 的顺序即归属优先级）
+- **`context_length` 必须下标**，单位是 **K**（核心 `comboContextWindow` 会换算回
+  token）。以前 `fetchModels` 恒填 `contextWindow: 0`，于是核心那条
+  `if (m.contextWindow > 0)` 永不成立 → 窗口永远拿不到 → 自动压缩一直跳过。
+  现在 32+ 个模型都带上真实窗口（`context_window_tokens.dev`）
+- 远端名录拿不到时，退回**主 function 一家的表**（改动前的历史行为），不是把
+  详细表并集原样端出去——并集里有一半是其它 function 独有的内部件
+  （`title_generation` / `fast_apply` / `*‑auto` 变体…）
+
+### 模型覆盖与已知边界
+
+- **签到判定**（见下）与 chat 是两套上游身份，模型表只服务 chat
+- 详细表里**不在**远端名录、也不在主 function 表里的行 **不发布**：实测
+  `computer_use_subagent` / `file_search_agent` 直接回 `code=3003`（不是对话模型）。
+  但 `explore_sub_agent_v2` / `summary` / `glm-5-turbo` / `aquila` / `sagitta` /
+  `seed-code-pro-0430` 实测都能正常出内容，故一并保留——**宁多留一个，不误杀可用模型**
+- 天花板与升级路径：若将来要严格对齐 IDE 名录（只发远端那 32 个），删掉
+  `fetchModels` 里「并上主 function 那一家」的那一段即可，一行级改动
+- 远端名录的窗口在同一模型多组间可能不一致，取**最大**值，避免面板窗口随上游
+  分组顺序变化
 
 ## 签到判定
 
 上游 `checkin_credits/*` **一律返回 HTTP 200**，成败只藏在 body 的 `code` 里：
 
-| code   | 含义                 | 处理                                                       |
-| ------ | -------------------- | ---------------------------------------------------------- |
-| `0`    | 成功                 | ok（**注意**：已签到后重复调用也返回 0，是幂等、不加积分） |
-| `9095` | 今日已签到           | already（幂等成功，不是失败）                              |
-| `9074` | 「当前参与用户太多」 | **账号级稳定拒绝**，不是抖动——只重试一次（等 1s）就判失败  |
-| `1001` | token/会话失效       | session_dead（与 chat 401 同义）                           |
+| code   | 含义                     | 处理                                                       |
+| ------ | ------------------------ | ---------------------------------------------------------- |
+| `0`    | 成功                     | ok（**注意**：已签到后重复调用也返回 0，是幂等、不加积分） |
+| `9095` | **该设备**今日已参与签到 | 见下——**不是**幂等成功（本机名额被别的账号用掉时，当前账号拿到它却一分没领到） |
+| `9074` | 「当前参与用户太多」     | **账号级稳定拒绝**，不是抖动——只重试一次（等 1s）就判失败  |
+| `1001` | token/会话失效           | session_dead（与 chat 401 同义）                           |
 
 据此定下的判定规则：
 
@@ -77,10 +121,43 @@ dsh plugin --profile web add dsh-router-traework
   `checkin_credits/status` 的 `checked_in`** 才算数
 - **不能拿积分当签到凭据** —— `ide_user_ent_usage` 是所有包的聚合剩余额度，
   签到前后可能是同一个数
-- `checked_in` 是**当前登录态设备**的读数，换 deviceId 会短暂变 `false`，
-  那是缓存假象，不代表「这个账号今天还能再签一次」
-- 判重维度是**账号**不是设备：换 deviceId 后 `checked_in` 依然是 `true`
-  （所以存量凭证把 deviceId 一次性迁到真实形态是安全的，不会重复签到）
+- **签到前先刷 token**：闲置账号的 accessToken 早已过期，不刷必然拿 1001
+  认证失败（chat 那条路一直有刷，签到以前没有——「一直没用过的号点签到」
+  就是这么失败的）
+
+关于 `9095`（**证据分级，别当成已实测**）：上游 `ug` 族的 NLS 文案是
+「该设备今日已参与签到」，口径指向**设备**；本插件的处理是防御式的——
+**不论 claim 回什么 code，都以回查 `checked_in` 为唯一凭据**：
+
+- 回查到 `checked_in=true` → 成功（`code 0` 那次是本次领到的，否则是本来就有的幂等）
+- 回查 `false` 且 claim 回 `9095` → 报独立的 `device_used` 并说明原因，
+  **不报 already**（把「没领到」说成「已领到」是这里唯一不能犯的错）
+- 其余 → 通用 error
+
+本机实测到的是：已领账号（`checked_in=true`）再 claim 一律回 `code 0`、与
+deviceId 无关（账号级幂等先行），所以 `9095` 那条分支**本机没能复现**——
+它只在「账号未领 + 设备名额已用」时出现，而本机三个账号当天都领过了。
+代码按上面的防御式处理，不改判定凭据（始终是 `checked_in`）。
+
+### `checked_in` 与 `did_checked_in` 是两个维度
+
+这两个字段常被当成一回事，判定维度其实不同（2026-10-10 实测复核）：
+
+| 字段             | 判定维度                       | 含义                                               |
+| ---------------- | ------------------------------ | -------------------------------------------------- |
+| `checked_in`     | **账号**                       | 该账号今天的签到奖励包已到账。换 deviceId 读数不变  |
+| `did_checked_in` | **设备**（`x-device-id` 的值） | 这台机器今天的名额已用，**不区分是哪个账号用的**   |
+
+实测：同一账号带本机真实设备号读是 `did_checked_in=true`、带另一个号读是
+`false`；重复读不会自己变 `true`（只有真 claim 才置位）；而 `checked_in` 只随
+账号变。
+
+于是有 `!checkedIn && didCheckedIn` 这一态：本机名额已被用掉（可能是另一个账号
+领的），**而这个账号一分没领到**。这时 claim 只会被 9095 拒，插件如实报
+`device_used`，不谎报成功。
+
+（曾把 `checked_in` 记成「当前登录态设备的读数、换 deviceId 会短暂变 false」——
+那是 `did_checked_in` 的行为，记反了。）
 
 ### 剩余积分的计算
 
