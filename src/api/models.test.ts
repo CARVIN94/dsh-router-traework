@@ -225,7 +225,7 @@ test('listModels 落 context_length（契约单位 K），不再是 0', async ()
 
 /**
  * 闲置账号的 accessToken 早就过期了（实测本机三个号全是），而「获取模型」这条
- * 路以前**不刷 token**：拿旧 token 打上游 → 401 → catch 吞掉 → 返回空列表。
+ * 路以前**不刷 token**：拿旧 token 打上游 → 401 → 静默失败。
  * 用户看到的是「点了获取模型没反应」，完全看不出是 token 的锅。
  *
  * 同类欠账三处：获取模型 / 拉积分 / 签到（只有 chatOnce 刷）。签到那处已单独
@@ -272,8 +272,68 @@ test('获取模型前先刷过期 token（闲置号不该静默拿到空列表�
     await sup.start()
     calls.length = 0
     const models = await sup.listModels(true)
-    assert.equal(calls[0], 'refresh', '拉模型前必须先刷 token，否则静默拿到空表')
+    assert.equal(calls[0], 'refresh', '拉模型前必须先刷 token，否则拿旧 token 打上游只会拿到空表/报错')
     assert.ok(models.some((m) => m.id === 'glm-5.2'), '刷完要真的拿到模型')
+    sup.dispose()
+  } finally {
+    globalThis.fetch = orig
+  }
+})
+
+/**
+ * 「获取模型只有几个」——用户实测报的那个 bug。
+ *
+ * 原实现 `catch {}` 吞掉拉取失败，然后 `listModels` 返回 `allModels()`：
+ * 缓存为空时那**恰好只剩 custom 那几个 id**（本机就是 DeepSeek-V4-Pro-Official /
+ * qwen3.8-max / file_search_agent 三个），看起来像一次成功的拉取。核心信了这份
+ * 「结果」并缓存 10 分钟 → 面板一直只有 3 个，点一次「获取模型」才恢复。
+ *
+ * 契约要求（docs/suppliers.md「模型统一策略」）：*「别用『返回空』表达『上游出错』；
+ * 出错就抛,核心会退回旧值(首次则整个供应商剔除)」*。所以这里锁两件事：
+ * 拉取失败必须**抛**，且**绝不能**把 custom 当名录端出去。
+ */
+test('拉模型失败 → 抛错（不拿自定义模型冒充名录）', async () => {
+  const { TraeworkSupplier } = await import('./index.ts')
+  const orig = globalThis.fetch
+  globalThis.fetch = (async (url: string) => {
+    const u = String(url)
+    // 上游整条路都坏掉：名录 500、详情也 500
+    if (u.includes('/api/remote/v1/models') || u.includes('/api/ide/v1/get_detail_param')) {
+      return new Response('boom', { status: 500 })
+    }
+    return new Response('{}', { status: 200 })
+  }) as typeof fetch
+  const creds = {
+    list: () => ['u1'],
+    get: <T = unknown>(): T => ({
+      auth: { accessToken: 'at', refreshToken: 'rt', expiresAt: Math.floor(Date.now() / 1000) + 3600, domain: 'trae.cn', apiHost: '', machineId: 'm', deviceId: '1711320556112436' },
+      account: { uid: 'u1', enterpriseId: '', nickname: 'u1' },
+    }) as T,
+    save: () => {},
+    remove: () => {},
+  }
+  // 关键：custom 非空——正是它让「失败」伪装成了「只有 3 个模型」
+  const store = {
+    get: () => ({
+      alias: 'traework', disabled: [], poolStrategy: 'fallback' as const, credits: {},
+      custom: ['DeepSeek-V4-Pro-Official', 'qwen3.8-max', 'file_search_agent'], poolOrder: [],
+    }),
+    setAlias: () => {}, setPoolOrder: () => {}, setPoolStrategy: () => {},
+    setModelEnabled: () => {}, addCustomModel: () => {}, removeCustomModel: () => {}, setAllModelsEnabled: () => {},
+    getCredits: () => -1, putCredits: (_i: string, _u: string, reported: number) => reported, clearCredits: () => {},
+  }
+  const logs: string[] = []
+  try {
+    const sup = new TraeworkSupplier({ stateFile: '' }, store, creds, (m) => logs.push(m))
+    await sup.start()
+    await assert.rejects(
+      async () => { await sup.listModels(true) },
+      '拉取失败必须抛，核心才能保住旧值（首次则剔除该供应商）',
+    )
+    assert.ok(
+      logs.some((m) => m.includes('拉取模型失败')),
+      `失败要留日志（这条路上原来一条日志都没有）：${JSON.stringify(logs)}`,
+    )
     sup.dispose()
   } finally {
     globalThis.fetch = orig

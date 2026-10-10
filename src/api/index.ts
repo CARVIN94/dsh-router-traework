@@ -256,10 +256,12 @@ export class TraeworkSupplier implements Supplier {
   // 可用模型管理（启用/禁用/自定义/别名 → 通用层 SupplierConfigStore）
   // -------------------------------------------------------------------------
 
-  // 模型列表：每次从上游拉取（不主动缓存——缓存由 dsh-router 核心统一管，
-  // 插件只在拉取失败时回退上次成功结果，避免面板空模型）。
+  // 模型列表：每次都真拉上游；缓存由 dsh-router 核心统一管（Router.modelsOf，
+  // TTL 10 分钟）。拉取失败**必须抛**，不能返回一份「看起来成功」的列表——
+  // 详见 listModels 的注释。这里的 modelsCache 只为本地认 id 用（chatOnce 的
+  // mapModel 需要知道哪些 id 是自己的），不作为对外的拉取结果。
 
-  /** 上游拉取的模型 + 自定义模型（面板/路由共用）。无缓存时仅自定义。 */
+  /** 上游拉取的模型 + 自定义模型（本地认 id 用；核心自己也会并 custom）。 */
   private allModels(): ModelInfo[] {
     const base = [...(this.modelsCache ?? [])]
     for (const id of this.store.get(this.id).custom) {
@@ -279,13 +281,27 @@ export class TraeworkSupplier implements Supplier {
     return this.refreshFromUpstream().then(() => this.allModels())
   }
 
-  /** 从上游拉取模型列表（接口获取，不内置数据）。失败静默回退缓存/空。 */
+  /**
+   * 从上游拉取模型列表（接口获取，不内置数据）。
+   *
+   * **失败必须抛**——契约（docs/suppliers.md「模型统一策略」）：*「拉到空列表时
+   * 核心会保住旧值不当成新结果,所以别用『返回空』表达『上游出错』;出错就抛,
+   * 核心会退回旧值(首次则整个供应商剔除)」*。
+   *
+   * 这里原先 `catch {}` 吞掉一切，于是失败后 `listModels` 返回 `allModels()` ——
+   * 那在缓存为空时**恰好只有 custom 那几个 id**，看起来是一次成功的拉取。核心信了
+   * 这份「结果」并缓存 10 分钟，面板就一直只有那几个自定义模型（用户报的
+   * 「获取模型只有几个」），点一次「获取模型」force 才恢复。缓存归核心管，
+   * 插件不自作主张回退。
+   */
   private async refreshFromUpstream(): Promise<void> {
-    const acct = this.pool.authByUID(this.pool.list()[0]?.uid ?? '')
+    const uid = this.pool.list()[0]?.uid ?? ''
+    const acct = this.pool.authByUID(uid)
+    // 一个号都没有：不是上游出错，是这家确实没有可拉的名录。返回空列表是诚实的
+    // （自定义模型由核心自己并进来，见 router/index.ts 的 refreshModels）。
     if (!acct) return
     try {
-      // 先保证 token 可用：闲置号的 accessToken 早过期，直接拉会静默拿到空表
-      // （catch 吞掉），表现为「获取模型点了没反应」。
+      // 先保证 token 可用：闲置号的 accessToken 早过期，直接拉会拿到空表。
       await this.freshAuth(acct)
       const models = await this.client.fetchModels(acct)
       const fetched: ModelInfo[] = []
@@ -303,12 +319,14 @@ export class TraeworkSupplier implements Supplier {
         fetched.push(entry)
         if (m.function !== '' && m.function !== SOLO.Function) byFunction.set(m.id, m.function)
       }
-      if (fetched.length > 0) {
-        this.modelsCache = fetched
-        this.modelFunctions = byFunction
-      }
-    } catch {
-      // 拉取失败回退缓存/空
+      // fetchModels 已保证非空（远端与详情都空时它自己抛）——这里不再兜一遍空表，
+      // 免得写出永远不会走的分支。
+      this.modelsCache = fetched
+      this.modelFunctions = byFunction
+    } catch (err) {
+      // 记一笔再抛：这条路上原来完全没有日志，症状只能靠面板猜。
+      this.log(`traework: 拉取模型失败(uid=${uid}) ${(err as Error).message}`)
+      throw err
     }
   }
 
