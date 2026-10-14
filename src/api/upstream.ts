@@ -116,6 +116,22 @@ function positiveNumber(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0
 }
 
+/**
+ * 上游 `context_window_tokens` → 取**更宽**的那个档。
+ *
+ * 只读 `dev` 会把窗口低估到实际上限的几分之一（issue #11）。2026-10-14 实测：
+ * 同一个 `mimo-v2.6-pro`，`solo_work_lite` 只给 `{dev:200000}`，而 `chat_v3`
+ * 给 `{dev:200000, max:981504}`；`step-5-preview` 更极端（`dev:116000`,
+ * `max:1000000`）。核心按最小窗口判组合可用性，低估的后果是长会话被提前判超限。
+ *
+ * 两个档都**可能缺**（`solo_coder` 的 `DeepSeek-V4-Pro` 只有 `dev`；
+ * `solo_work_lite` 的 `DeepSeek-V4-Pro` 没有 `max`），所以各自先过
+ * positiveNumber，不能用 `??` 兜底。
+ */
+function widestWindow(tokens: { dev?: number; max?: number } | undefined): number {
+  return Math.max(positiveNumber(tokens?.dev), positiveNumber(tokens?.max))
+}
+
 /** 显示名归一化，用于 config_name 与远端名录的跨源 join。 */
 function displayKey(name: string): string {
   return name.trim().toLowerCase()
@@ -783,17 +799,27 @@ export class SoloClient {
       for (const cfg of list) {
         const c = cfg as {
           config_name?: string
-          context_window_tokens?: { dev?: number }
+          context_window_tokens?: { dev?: number; max?: number }
           model_detail_list?: Array<{ max_tokens?: number }>
           display_config?: { display_name?: string; is_custom_model?: boolean }
         }
         const id = c.config_name
         if (id === undefined || id === '' || !isRosterCandidate(id, c.display_config?.is_custom_model)) continue
-        if (wire.has(id)) continue
-        const dev = positiveNumber(c.context_window_tokens?.dev)
+        const contextWindow = widestWindow(c.context_window_tokens)
         const maxTokens = positiveNumber(c.model_detail_list?.[0]?.max_tokens)
-        wire.set(id, { fn, contextWindow: dev, maxTokens, name: c.display_config?.display_name ?? '' })
-        const key = displayKey(c.display_config?.display_name ?? '')
+        const name = c.display_config?.display_name ?? ''
+        const prev = wire.get(id)
+        if (prev !== undefined) {
+          // 归属 function 仍是**先命中者**（顺序即优先级，见 constants.ts），
+          // 但窗口要取跨 function 的**更宽者**：宽的那个才是模型真实上限，
+          // 窄的只是该 function 自己暴露的档位。以前这里直接 `continue`，
+          // 于是先命中者报 200K、后命中者报 1000K 时窗口被锁死在 200K。
+          if (contextWindow > prev.contextWindow) prev.contextWindow = contextWindow
+          if (prev.maxTokens === 0 && maxTokens > 0) prev.maxTokens = maxTokens
+          continue
+        }
+        wire.set(id, { fn, contextWindow, maxTokens, name })
+        const key = displayKey(name)
         if (key !== '' && !wireByName.has(key)) wireByName.set(key, id)
       }
     }
@@ -807,7 +833,7 @@ export class SoloClient {
     }
     if (remote.length > 0) {
       // 远端的每一行都是厂商愿意给用户看的模型（Trae IDE 的模型选择器读它），
-      // 作为骨架：顺序按厂商的，窗口用它给的 dev。
+      // 作为骨架：顺序按厂商的，窗口取 dev/max 里更宽的那个。
       for (const m of remote) {
         const id = wire.has(m.id) ? m.id : wireByName.get(displayKey(m.displayName))
         if (id === undefined) continue
@@ -817,7 +843,9 @@ export class SoloClient {
           id,
           name: m.displayName !== '' ? m.displayName : w.name,
           function: w.fn,
-          contextWindow: m.contextWindow > 0 ? m.contextWindow : w.contextWindow,
+          // 取**更宽**者：远端名录与详细表是两个来源、两套档位，谁报得宽谁更接近
+          // 真实上限。以前是「远端有值就一律用远端」，远端只报 dev 时同样低估。
+          contextWindow: Math.max(m.contextWindow, w.contextWindow),
           maxTokens: w.maxTokens,
         })
       }
@@ -893,15 +921,15 @@ export class SoloClient {
       const byId = new Map<string, { id: string; displayName: string; contextWindow: number }>()
       for (const group of json.data?.list ?? []) {
         for (const raw of group.models ?? []) {
-          const m = raw as { name?: string; display_name?: string; context_window_tokens?: { dev?: number } }
+          const m = raw as { name?: string; display_name?: string; context_window_tokens?: { dev?: number; max?: number } }
           const id = m.name
           if (id === undefined || id === '') continue
-          const dev = positiveNumber(m.context_window_tokens?.dev)
+          const window = widestWindow(m.context_window_tokens)
           const prev = byId.get(id)
           byId.set(id, {
             id,
             displayName: m.display_name ?? prev?.displayName ?? '',
-            contextWindow: Math.max(dev, prev?.contextWindow ?? 0),
+            contextWindow: Math.max(window, prev?.contextWindow ?? 0),
           })
         }
       }

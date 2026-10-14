@@ -86,7 +86,15 @@ accessToken 早就过期了（实测本机三个号全是），哪条路少这�
 - **`context_length` 必须下标**，单位是 **K**（核心 `comboContextWindow` 会换算回
   token）。以前 `fetchModels` 恒填 `contextWindow: 0`，于是核心那条
   `if (m.contextWindow > 0)` 永不成立 → 窗口永远拿不到 → 自动压缩一直跳过。
-  现在 32+ 个模型都带上真实窗口（`context_window_tokens.dev`）
+  现在 32+ 个模型都带上真实窗口（`context_window_tokens`，见下条）
+- **窗口取 `dev` / `max` 的更宽者**（issue #11）。上游这两档都实际在用：实测
+  `chat_v3` 的 `mimo-v2.6-pro` 报 `{dev:200000, max:981504}`，`step-5-preview`
+  报 `{dev:116000, max:1000000}`。只读 `dev` 会把窗口低估，而核心按组合各腿的
+  **最小**窗口判可用性 → 长会话被提前判超限。两档都**可能缺**
+  （`solo_work_lite` 的 `DeepSeek-V4-Pro` 只有 `dev`；`solo_coder` 的
+  `DeepSeek-V4-Pro` 是 `{dev:200000, max:200000}`），所以各自先过
+  `positiveNumber` 再取 max。同一模型被多个 function 列出时，**function 归属
+  仍是先命中者**（顺序即优先级，不能改），只有窗口取跨 function 的最宽者
 - 远端名录拿不到时，退回**主 function 一家的表**（改动前的历史行为），不是把
   详细表并集原样端出去——并集里有一半是其它 function 独有的内部件
   （`title_generation` / `fast_apply` / `*‑auto` 变体…）
