@@ -162,7 +162,16 @@ export class Pool {
   }
 
   /** 返回所有账号状态（按连接池顺序，稳定输出）。
-   *  只报「现在状态」：凭证 + 积分。冷却/禁用/错误累计由核心叠加。 */
+   *  只报「现在状态」：凭证 + 积分。冷却/禁用/错误累计由核心叠加。
+   *
+   *  `credits === 0` 报 `quota`：积分用完的号在上游**必失败**（实测 HTTP 200 +
+   *  流内 4008 `exceeded the quota`），而且失败发生在流已提交之后——这次请求
+   *  救不回来。报出去让核心按 quota 处置（10 分钟冷却），该号随即退出选号，
+   *  后续请求换到还有余额的号上。
+   *
+   *  注意区分 `CREDITS_UNKNOWN`(-1)：那是「还没拉到」，此刻对这个号一无所知，
+   *  不能当成用完（0 才是真值「用完了」，见常量注释）。核心只认这里报的语义
+   *  状态，不会自己去比 credits（其它供应商 `credits: 0` 是「没有积分这个概念」）。 */
   list(): AccountStatus[] {
     const out: AccountStatus[] = []
     const alive = new Set(this.byUID.keys())
@@ -177,7 +186,9 @@ export class Pool {
         uid,
         nickname: e.a.nickname || undefined,
         credits: e.credits,
-        state: e.a.accessToken === '' ? 'session_dead' : 'ok',
+        state: e.a.accessToken === ''
+          ? 'session_dead'
+          : e.credits === 0 ? 'quota' : 'ok',
       })
     }
     return out

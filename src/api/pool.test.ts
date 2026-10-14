@@ -75,3 +75,40 @@ test('旧文件里的 order/strategy 照常读（迁移没碰坏其它字段）'
   assert.deepEqual(pool.getOrder(), ['u1'])
   assert.equal(pool.getStrategy(), 'round-robin')
 })
+
+// ---- 积分用完 → 报 quota（核心据此把该号移出选号） ----
+// 背景：积分 0 的号在上游必失败，且是 **HTTP 200 + 流内 4008**（响应已提交，
+// 这次请求救不回来）。只在失败后记账 = 每个请求都白撞一次才换号。报 quota 让
+// 核心**提前**把该号排除，用户第一次就不会撞上。
+
+test('积分用完（0）→ 报 quota，不再报 ok', () => {
+  const pool = new Pool('')
+  pool.add(authOf('u1'))
+  pool.setCredits('u1', 0)
+  const st = pool.list()[0]
+  assert.equal(st?.credits, 0)
+  assert.equal(st?.state, 'quota', '0 积分 = 额度不足，必须让核心看见')
+})
+
+test('还没拉到积分（-1）≠ 用完：仍报 ok，不能误判成 quota', () => {
+  const pool = new Pool('')
+  pool.add(authOf('u1'))
+  assert.equal(pool.list()[0]?.credits, CREDITS_UNKNOWN)
+  assert.equal(pool.list()[0]?.state, 'ok', '-1 是「不知道」，不是「用完了」')
+})
+
+test('还有余额 → 报 ok（quota 只针对 0）', () => {
+  const pool = new Pool('')
+  pool.add(authOf('u1'))
+  pool.setCredits('u1', 0.5)
+  assert.equal(pool.list()[0]?.state, 'ok', '小数余额也是余额')
+})
+
+test('token 失效优先于 quota：报 session_dead', () => {
+  const pool = new Pool('')
+  const a = authOf('u1')
+  a.accessToken = ''
+  pool.add(a)
+  pool.setCredits('u1', 0)
+  assert.equal(pool.list()[0]?.state, 'session_dead', '凭证都没了，先修登录')
+})

@@ -61,6 +61,9 @@ export interface SupplierEnvLike {
  * 账户此刻的状态 —— 插件**解读**上游信号后的语义状态。
  * 插件只报「现在怎么了」，不说「该怎么办」：冷却多久、是否禁用、要不要换号
  * 都是核心的策略。
+ *
+ * 注意 `status()` 里报 `quota` / `session_dead` 会被核心当成「此刻别选它」
+ * （要靠充值/重登才能恢复的账号级事实），不只是失败后的处置依据。
  */
 export type AccountState =
   | 'ok'            // 正常

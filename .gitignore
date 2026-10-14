@@ -1,4 +1,7 @@
-node_modules/
+# 不带尾斜杠：worktree 里常把 node_modules 做成指向主检出的**符号链接**，
+# 而 `node_modules/` 只匹配目录，符号链接会被当成文件 tracked 进去
+# （提交一条指向绝对路径的链接，换台机器就是死链）。同 dsh-router。
+node_modules
 lib/
 *.log
 .DS_Store
