@@ -15,6 +15,12 @@
  *      模型选择器；远端名录正是厂商给用户看的那一份。
  *   4. 远端名录**拿不到**时退回「主 function 一家的表」（历史行为），而不是把
  *      并集原样端出去。
+ *   5. **窗口取 `context_window_tokens` 里 `dev` / `max` 的更宽者**（issue #11）。
+ *      上游两个档都实际在用：`chat_v3` 的 `mimo-v2.6-pro` 报
+ *      `{dev:200000, max:981504}`，只读 `dev` 会把窗口低估，而核心按**最小**
+ *      窗口判组合可用性 → 长会话被提前判超限。`max` 可能缺失
+ *      （`solo_work_lite` 的 `DeepSeek-V4-Pro` 只有 `dev`），所以两档各自先过
+ *      `positiveNumber` 再取 max。
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -27,11 +33,11 @@ const auth: Auth = {
   enterpriseId: '', nickname: 'u1', filePath: '',
 }
 
-/** 详细表一行（只放本测试关心的字段）。 */
-function detail(configName: string, dev: number, maxTokens: number, displayName = configName, isCustom = false) {
+/** 详细表一行（只放本测试关心的字段）。`max <= 0` = 上游没给 max 档。 */
+function detail(configName: string, dev: number, maxTokens: number, displayName = configName, isCustom = false, max = 0) {
   return {
     config_name: configName,
-    context_window_tokens: { dev },
+    context_window_tokens: max > 0 ? { dev, max } : { dev },
     model_detail_list: [{ max_tokens: maxTokens }],
     display_config: { display_name: displayName, is_custom_model: isCustom },
   }
@@ -135,6 +141,114 @@ test('fetchModels：同一模型在多组出现 → 窗口取最大（上游分�
     const models = await new SoloClient({ timeoutSeconds: 5 }).fetchModels(auth)
     assert.equal(models.length, 1)
     assert.equal(models[0]?.contextWindow, 256000, '同一模型取更宽的那个，别让面板窗口随分组顺序变化')
+  } finally {
+    restore()
+  }
+})
+
+/**
+ * issue #11：上游的 `context_window_tokens` 有 `dev` / `max` 两个档，只读 `dev`
+ * 会把窗口低估到实际上限的几分之一。2026-10-14 对真实上游实测：
+ *
+ *   solo_work_lite / mimo-v2.6-pro → {dev:200000}           （没有 max 档）
+ *   chat_v3        / mimo-v2.6-pro → {dev:200000, max:981504}
+ *   chat_v3 / step-5-preview       → {dev:116000, max:1000000}
+ *   solo_coder / DeepSeek-V4-Pro   → {dev:200000, max:200000}
+ *
+ * 核心用**最小**窗口判组合可用性，低估 = 长会话被提前判超限。
+ */
+test('fetchModels：详细表只给 dev 时也读 max（issue #11）', async () => {
+  const { restore } = installFake({
+    // 注意：只有主 function 那一家进 roster，所以这里把它设成带 max 的那个。
+    detail: { solo_work_lite: [detail('glm-5.2', 200000, 32000, 'GLM-5.2', false, 981504)] },
+  })
+  try {
+    const models = await new SoloClient({ timeoutSeconds: 5 }).fetchModels(auth)
+    assert.equal(models[0]?.contextWindow, 981504, 'max 档更宽，必须采纳而不是只看 dev')
+  } finally {
+    restore()
+  }
+})
+
+test('fetchModels：dev 比 max 宽时取 dev（不是无脑取 max）', async () => {
+  const { restore } = installFake({
+    detail: { solo_work_lite: [detail('glm-5.2', 300000, 32000, 'GLM-5.2', false, 200000)] },
+  })
+  try {
+    const models = await new SoloClient({ timeoutSeconds: 5 }).fetchModels(auth)
+    assert.equal(models[0]?.contextWindow, 300000, '取两者更宽者，谁大用谁')
+  } finally {
+    restore()
+  }
+})
+
+test('fetchModels：只有 dev、没有 max 时不炸且取 dev（真实边界）', async () => {
+  const { restore } = installFake({
+    detail: { solo_work_lite: [detail('DeepSeek-V4-Pro', 200000, 32000, 'DeepSeek-V4-Pro')] },
+  })
+  try {
+    const models = await new SoloClient({ timeoutSeconds: 5 }).fetchModels(auth)
+    assert.equal(models[0]?.contextWindow, 200000, 'max 缺失时 positiveNumber 兜成 0，Math.max 取 dev')
+  } finally {
+    restore()
+  }
+})
+
+/**
+ * issue #11 的核心症状：同一模型被多个 function 列出，**先命中者拥有 function
+ * 归属**（顺序即优先级，不能改），但窗口必须取跨 function 的更宽者。
+ *
+ * 实测 `mimo-v2.6-pro`：solo_work_lite 报 {dev:200000}，chat_v3 报
+ * {dev:200000,max:981504}。旧代码 `if (wire.has(id)) continue` 直接丢掉后者
+ * → 窗口锁死 200K。
+ */
+test('fetchModels：先命中者保留 function 归属，但窗口取跨 function 最宽（issue #11）', async () => {
+  const { restore } = installFake({
+    detail: {
+      // DirectoryFunctions 顺序：solo_work_lite 在 chat_v3 之前 ⇒ 归属归 solo_work_lite
+      solo_work_lite: [detail('mimo-v2.6-pro', 200000, 0, 'MiMo-V2.6-Pro')],
+      chat_v3: [detail('mimo-v2.6-pro', 200000, 32000, 'MiMo-V2.6-Pro', false, 981504)],
+    },
+  })
+  try {
+    const models = await new SoloClient({ timeoutSeconds: 5 }).fetchModels(auth)
+    const hit = models.find((m) => m.id === 'mimo-v2.6-pro')
+    assert.equal(hit?.contextWindow, 981504, '窗口取更宽者')
+    assert.equal(hit?.function, 'solo_work_lite', 'function 归属仍是先命中者，别改成报得宽的那家')
+    assert.equal(hit?.maxTokens, 32000, 'max_tokens 同理：先命中者没给时补上后命中者的值，别一起丢掉')
+  } finally {
+    restore()
+  }
+})
+
+test('fetchModels：远端名录窗口比详细表窄时取详细表的（两个来源，谁宽用谁）', async () => {
+  // 实测形态：远端 /api/remote/v1/models 对 solo_work_lite 只报 {dev:200000}，
+  // 而 chat_v3 的详细表报 {dev:200000,max:981504}。旧代码「远端有值就一律用
+  // 远端」，于是详细表的宽档被远端盖掉。
+  const { restore } = installFake({
+    remote: {
+      data: { list: [{ function: 'solo_work_lite', models: [{ name: 'mimo-v2.6-pro', display_name: 'MiMo-V2.6-Pro', context_window_tokens: { dev: 200000 } }] }] },
+    },
+    detail: { solo_work_lite: [detail('mimo-v2.6-pro', 116000, 32000, 'MiMo-V2.6-Pro', false, 981504)] },
+  })
+  try {
+    const models = await new SoloClient({ timeoutSeconds: 5 }).fetchModels(auth)
+    assert.equal(models[0]?.contextWindow, 981504, '详细表更宽时不能被远端名录的窄值盖掉')
+  } finally {
+    restore()
+  }
+})
+
+test('fetchModels：远端名录自己给了 max 时也采纳（两个读取点都要看 max）', async () => {
+  const { restore } = installFake({
+    remote: {
+      data: { list: [{ function: 'solo_work_lite', models: [{ name: 'step-5-preview', display_name: 'Step-5-Preview', context_window_tokens: { dev: 116000, max: 1000000 } }] }] },
+    },
+    detail: { solo_work_lite: [detail('step-5-preview', 200000, 32000, 'Step-5-Preview')] },
+  })
+  try {
+    const models = await new SoloClient({ timeoutSeconds: 5 }).fetchModels(auth)
+    assert.equal(models[0]?.contextWindow, 1000000, '远端名录这一路也必须读 max')
   } finally {
     restore()
   }
