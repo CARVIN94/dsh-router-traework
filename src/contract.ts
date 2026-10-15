@@ -106,8 +106,12 @@ export type ChatOnceResult =
   | { ok: true; stream: ReadableStream<Uint8Array> }
   /** 非流式：核心写 JSON。 */
   | { ok: true; status: number; body: string }
-  /** 失败：核心据此做冷却/禁用/换号。 */
-  | { ok: false; state: AccountState; message: string }
+  /**
+   * 失败：核心据此做冷却/禁用/换号。
+   * `resetAt` = 上游自己声明的重置时刻（epoch ms，可选）：限流类错误带它时
+   * 核心冷却到该点而不是指数退避。
+   */
+  | { ok: false; state: AccountState; message: string; resetAt?: number }
 
 /** 供应商配置：dsh-router 核心注入的运行时环境。 */
 export interface SupplierEnv {
