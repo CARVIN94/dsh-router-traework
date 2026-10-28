@@ -381,7 +381,7 @@ export class TraeworkSupplier implements Supplier {
    *
    *  `!checkedIn && didCheckedIn` = 本机名额被（另一个账号）用掉，而这个账号
    *  一分没领到。此时 claim 必被拒，如实报 device_used，**不能**报「今日已签到」。 */
-  async checkinNow(uid: string): Promise<{ ok: boolean; status: 'ok' | 'already' | 'disabled' | 'device_used' | 'error'; message?: string }> {
+  async checkinNow(uid: string): Promise<{ ok: boolean; status: 'ok' | 'already' | 'disabled' | 'device_used' | 'device_missing' | 'error'; message?: string }> {
     const st = this.pool.list().find((s) => s.uid === uid)
     if (st === undefined) return { ok: false, status: 'error', message: '链接不存在' }
     const a = this.pool.authByUID(uid)
@@ -402,6 +402,16 @@ export class TraeworkSupplier implements Supplier {
       }
       const claimed = await this.client.checkinClaim(a)
       this.log(`checkin ${uid}: ${claimed}`)
+      if (claimed === 'device_missing') {
+        // 9004：上游不认本机的设备身份（缺设备头或设备号未被接受），这次 claim
+        // 没有资格发。回查一定还是 false，别再浪费一次读；也不能只报「签到未生效」
+        // ——那会让用户反复重试同一个注定失败的按钮，真正该做的是重新登录换设备身份。
+        return {
+          ok: false,
+          status: 'device_missing',
+          message: '上游拒绝签到（9004：设备身份缺失或未被接受）：请重新登录该账号以刷新设备身份后再签',
+        }
+      }
       // 回查：claim 返回 0 也不代表真签上了，checked_in 才是凭据
       const after = await this.client.checkinStatus(a)
       await this.refreshCreditsAfterCheckin(uid, a)

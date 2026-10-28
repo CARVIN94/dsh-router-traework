@@ -12,6 +12,11 @@
  *   - 签到成败以回查 status.checked_in 为准，不靠积分（积分是所有包的聚合
  *     剩余额度，实测签到前后可能是同一个数，拿它判成败会谎报成功）
  *   - 已签到（checked_in=true）是幂等成功，不是失败
+ *   - status 的 `enable` 缺省 = 开放（只有明确的 false 才算未开放）：把缺省读成
+ *     关闭会拦掉唯一该发的那次 claim（2026-10-28 订正）
+ *   - claim 9004 = 缺 `x-device-id`（不是限流）→ device_missing，且不再回查
+ *   - 9074 的报错文案要能直接给用户看（说明「稍后再试、不是限流」），而不是
+ *     只把上游原文抛出去
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -136,6 +141,10 @@ test('9074 重试后仍然 9074 → 报错且带 code', async () => {
     assert.equal(r.ok, false)
     assert.equal(r.status, 'error')
     assert.match(r.message ?? '', /9074/)
+    // 文案要能直接给用户看：说清「稍后再试」和「不是限流」，否则面板读起来
+    // 像插件自己坏了
+    assert.match(r.message ?? '', /稍后再试/)
+    assert.match(r.message ?? '', /不是限流/)
   } finally {
     restore()
   }
@@ -308,5 +317,60 @@ test('checkinNow 先刷过期 token 再读状态（闲置号不该报认证失�
     sup.dispose()
   } finally {
     globalThis.fetch = orig
+  }
+})
+/**
+ * `enable` 缺省 = 开放（2026-10-28 订正）。
+ *
+ * 旧实现 `!!r.enable`：上游一旦省略该字段（旧版本/灰度），「活动正常」被读成
+ * 「今日未开放」，于是唯一该发的那次 claim 被插件自己拦掉——用户看到「未开放」
+ * 却什么也没发生。只有明确的 `false` 才算关闭。
+ */
+test('status 缺 enable 字段 → 按开放处理，真的去 claim', async () => {
+  const calls: string[] = []
+  const restore = installFake({
+    status: [
+      { code: 0, checked_in: false, credits: 200 }, // 没有 enable 字段
+      { code: 0, checked_in: true, enable: true, credits: 200 }, // 回查：已签上
+    ],
+    claim: [{ code: 0, message: 'success' }],
+    onCall: (kind, n) => calls.push(`${kind}#${n}`),
+  })
+  try {
+    const r = await (await makeSupplier()).checkinNow(UID)
+    assert.equal(r.status, 'ok', '缺 enable 不该被判成「今日未开放」')
+    assert.equal(r.ok, true)
+    assert.equal(calls.filter((c) => c.startsWith('claim')).length, 1, '缺 enable 时必须真的去签')
+  } finally {
+    restore()
+  }
+})
+
+/**
+ * 9004 = 上游说「订单参数不正确」，口径指向设备身份（缺 `x-device-id` 或设备号
+ * 不被接受）——不是限流。
+ *
+ * 本插件的设备头正常不会缺（老凭证装载时会补 16 位 deviceId），所以 9004 落到
+ * 这里实际意味着「设备身份没被上游接受」：要报可行动的 device_missing（重新登录），
+ * 而不是笼统 error 让用户反复点一个注定失败的按钮。也不该再回查 status ——
+ * 这次 claim 根本没资格发；更不该重试（只会再拿一次 9004）。
+ */
+test('claim 9004 → device_missing，不重试、不回查、不报限流', async () => {
+  const calls: string[] = []
+  const restore = installFake({
+    status: [{ code: 0, checked_in: false, enable: true, credits: 200 }],
+    claim: [{ code: 9004, message: 'The submitted order parameters are incorrect. Please try placing the order again' }],
+    onCall: (kind, n) => calls.push(`${kind}#${n}`),
+  })
+  try {
+    const r = await (await makeSupplier()).checkinNow(UID)
+    assert.equal(r.ok, false)
+    assert.equal(r.status, 'device_missing', '要能区分「设备身份不被接受」，别混进通用 error')
+    assert.match(r.message ?? '', /设备身份/, '文案要指出问题在设备身份')
+    assert.match(r.message ?? '', /9004/)
+    assert.equal(calls.filter((c) => c.startsWith('status')).length, 1, '9004 之后不该再浪费一次状态回查')
+    assert.equal(calls.filter((c) => c.startsWith('claim')).length, 1, '9004 不该触发重试')
+  } finally {
+    restore()
   }
 })

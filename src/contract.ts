@@ -162,6 +162,8 @@ export interface SupplierModule {
   generateLoginUrl?(): string | { ok: boolean; error?: string; loginUrl?: string }
   completeLogin?(callbackUrl: string): Promise<{ uid: string; nickname: string }>
   /** 单个链接签到。遍历所有链接 + 结果汇总是 dsh-router 核心的活。
-   *  status: 'ok'(签到成功) / 'already'(今日已签到) / 'error'(失败)。 */
+   *  status: 'ok'(签到成功) / 'already'(今日已签到) / 'disabled'(今日未开放) /
+   *          'device_used'(本机名额已用，该账号今天领不到) /
+   *          'device_missing'(缺设备身份 9004，需重新登录) / 'error'(失败)。 */
   checkinNow?(uid: string): Promise<{ ok: boolean; status: string; message?: string }>
 }

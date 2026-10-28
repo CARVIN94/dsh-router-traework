@@ -57,6 +57,19 @@ const CHECKIN_BUSY_CODE = 9074
 const CHECKIN_BUSY_RETRY_MS = 1000
 
 /**
+ * 签到业务码 9004：上游说「提交的订单参数不正确」——实测口径指向**设备身份**
+ * （`x-device-id` 缺失或不被接受）。
+ *
+ * 2026-09-24 实测（与 dsh-connect-trae 的独立结论一致）：claim 不带设备头时上游
+ * 一律 9004。本插件的设备头**正常不会缺**（老凭证会在装载时补一个 16 位数字
+ * deviceId，见 index.ts），所以 9004 落到这里实际意味着「本机设备身份没被上游
+ * 接受」。它既不是「今日已签」也不是限流，报成 soft_rate 会让用户以为账号被限、
+ * 去换号重试；真正该做的是刷新设备身份（重新登录）。故单独分类 device_missing，
+ * 不重试（重试只会再拿一次 9004）。
+ */
+const CHECKIN_DEVICE_HEADER_MISSING_CODE = 9004
+
+/**
  * 主动刷新上限：accessToken 距**签发**超过这么久就刷新轮换，不等到临到期。
  *
  * 为什么需要（对齐 codebuddy 2026-09-16 的修法）：上游可服务端吊销旧凭据
@@ -962,7 +975,10 @@ export class SoloClient {
       checkedIn: !!r.checked_in,
       didCheckedIn: !!r.did_checked_in,
       credits: Number(r.credits ?? 0),
-      enable: !!r.enable,
+      // enable 缺省按**开放**处理：上游省略该字段时（旧版本/灰度），`!!undefined`
+      // 会把「活动正常」读成「今日未开放」，于是唯一该发的那次 claim 被自己拦下。
+      // 只有明确的 false 才算关闭——少签一次的代价远大于多问一次上游。
+      enable: r.enable !== false,
     }
   }
 
@@ -980,25 +996,40 @@ export class SoloClient {
    *           见 CHECKIN_BUSY_CODE 注释：40 余次重试全失败、换 deviceId/token 无效）。
    *           保留一次快速重试（默认 1s）只兜「上游万一恢复成真抖动」，落空即判失败，
    *           不空耗 8s。
+   *  - 9004 = 缺 `x-device-id`（见 CHECKIN_DEVICE_HEADER_MISSING_CODE）→
+   *           'device_missing'，调用方据此提示重新登录，而不是当限流。
    *  - 9090 = 活动暂不可用（另一套 activity/action 体系，本插件不走）
    *  - 1001 = token/会话失效（与 chat 的 401 同义）→ session_dead
    *
    *  deviceId 依然要稳定——它参与上游风控画像，但**不必**为了绕过 9074 去换 id。 */
-  async checkinClaim(a: Auth): Promise<'ok' | 'device_used'> {
+  async checkinClaim(a: Auth): Promise<'ok' | 'device_used' | 'device_missing'> {
     for (let attempt = 0; ; attempt++) {
       const data = await this.doJSON(this.ugHost + SOLO.EpCheckinClaim, ugHeaders(a), {})
       const r = data as { code?: number; message?: string; msg?: string }
       const code = Number(r.code ?? 0)
+      const raw = r.message ?? r.msg ?? ''
       if (code === 0) return 'ok'
       if (code === CHECKIN_DEVICE_USED_CODE) return 'device_used'
-      const msg = `${r.message ?? r.msg ?? 'checkin failed'} (code=${code})`
+      if (code === CHECKIN_DEVICE_HEADER_MISSING_CODE) {
+        // 重试只会再拿一次 9004：缺的不是运气，是请求参数。
+        return 'device_missing'
+      }
       if (code === CHECKIN_BUSY_CODE && attempt === 0) {
         await this.sleepImpl(this.checkinRetryDelayMs)
         continue
       }
-      // 9074 是签到专属拒绝，与 chat 限流无关——报独立分类，不污染限流计数
-      const kind = code === CHECKIN_BUSY_CODE ? 'checkin_denied' : code === 1001 ? 'session_dead' : 'soft_rate'
-      throw new UpstreamError(kind, 200, msg)
+      if (code === CHECKIN_BUSY_CODE) {
+        // 9074 是签到专属拒绝（账号级稳定拒绝，与 chat 限流无关），报独立分类，
+        // 不污染限流计数；文案要能直接给用户看——上游原文「当前参与用户太多」
+        // 单独抛出时，面板看起来像本插件坏了。
+        throw new UpstreamError(
+          'checkin_denied',
+          200,
+          `上游拒绝发放签到奖励（code=9074${raw === '' ? '' : `：${raw}`}）：该账号今天领不到，已自动重试一次仍失败，稍后再试；这不是限流，换设备或换 token 都无效`,
+        )
+      }
+      const kind = code === 1001 ? 'session_dead' : 'soft_rate'
+      throw new UpstreamError(kind, 200, `${raw === '' ? 'checkin failed' : raw} (code=${code})`)
     }
   }
 
